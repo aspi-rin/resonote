@@ -1,0 +1,29 @@
+{
+  "name": "resonote",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "tsc --noEmit && vite build",
+    "bundle": "tauri build",
+    "check": "npm run build && npm run check:rust",
+    "check:rust": "cargo check --manifest-path src-tauri/Cargo.toml",
+    "format:check": "cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check",
+    "lint": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "tauri": "tauri",
+    "verify": "npm run build && npm run format:check && npm run lint && npm test"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-dialog": "2.7.2",
+    "preact": "10.29.7"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.2",
+    "@tauri-apps/cli": "2.11.4",
+    "typescript": "^5.9.3",
+    "vite": "8.1.5"
+  }
+}

@@ -1,0 +1,50 @@
+[package]
+name = "resonote"
+version = "0.1.1"
+description = "A resource-conscious local audio recorder and transcription tool"
+authors = ["Resonote contributors"]
+edition = "2024"
+rust-version = "1.87"
+
+[lib]
+name = "resonote_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+audioadapter = "4"
+audioadapter-buffers = "4"
+bzip2 = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+cpal = "0.18.1"
+crossbeam-channel = "0.5"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+rubato = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sherpa-onnx = "1.13.4"
+tar = "0.4"
+tauri = { version = "2.11.5", features = ["tray-icon"] }
+tauri-plugin-autostart = "2.5.1"
+tauri-plugin-dialog = "2.7.2"
+tauri-plugin-single-instance = "2.4.3"
+tempfile = "3"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# CPAL 0.18 accepts windows-core 0.61–0.62 independently from `windows`.
+# Tauri currently uses windows 0.61, so pin the matching core ABI.
+windows-core = "=0.61.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = "8.0.1"
+
+[dev-dependencies]
+claxon = "0.4"
