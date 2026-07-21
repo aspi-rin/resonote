@@ -1,0 +1,9 @@
+# Match the minimumSystemVersion declared in src-tauri/tauri.conf.json.
+# Rust's default macOS deployment target is 11.0; below 12.0 the Swift
+# concurrency runtime is not an OS library, so the screencapturekit crate's
+# Swift code links it via a back-deployment @rpath that bare test binaries
+# cannot resolve (dyld SIGABRT before any test runs).
+# Note: cargo discovers this file from the working directory upward, so keep
+# it at the repo root — npm scripts invoke cargo from here via --manifest-path.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "13.0"
