@@ -131,6 +131,25 @@ async fn set_recording_source(
 }
 
 #[tauri::command]
+async fn set_recording_languages(
+    app: tauri::AppHandle,
+    recognition_language: String,
+    translation_enabled: bool,
+    translation_target_language: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<RecordingService>().set_languages(
+            recognition_language,
+            translation_enabled,
+            translation_target_language,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn get_model_status(
     state: tauri::State<'_, Arc<ModelManager>>,
     model_id: String,
@@ -334,6 +353,7 @@ pub fn run() {
             list_transcription_models,
             open_recording_directory,
             save_settings,
+            set_recording_languages,
             set_recording_source,
             start_recording,
             stop_recording

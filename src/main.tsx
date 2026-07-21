@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { render } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { resolveLanguage, translator, type TranslationKey } from "./i18n";
+import packageMetadata from "../package.json";
 import {
   DEFAULT_MODEL_STATUS,
   DEFAULT_RECORDING_STATUS,
@@ -82,7 +83,7 @@ function App() {
   const selectedModelId = useRef(DEFAULT_SETTINGS.transcription.modelId);
   const modelSelectionVersion = useRef(0);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
-  const [version, setVersion] = useState("0.1.0");
+  const [version, setVersion] = useState(packageMetadata.version);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [modelTransitioning, setModelTransitioning] = useState(false);
@@ -303,6 +304,42 @@ function App() {
     }
   };
 
+  const changeRecordingLanguages = async (
+    recognitionLanguage: string,
+    translationEnabled: boolean,
+    translationTargetLanguage: string,
+  ) => {
+    const nextSettings = structuredClone(settings);
+    nextSettings.transcription.language = recognitionLanguage;
+    nextSettings.translation.enabled = translationEnabled;
+    nextSettings.translation.targetLanguage = translationTargetLanguage;
+    if (recording.phase !== "recording") {
+      setSaved(false);
+      setSettings(nextSettings);
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    try {
+      if (isTauri) {
+        await invoke("set_recording_languages", {
+          recognitionLanguage,
+          translationEnabled,
+          translationTargetLanguage,
+        });
+      }
+      setSettings(nextSettings);
+      if (isTauri) {
+        setSettings(await invoke<AppSettings>("save_settings", { settings: nextSettings }));
+      }
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const installModel = () => {
     if (!isTauri) {
       setModel({ ...model, phase: "downloaded", downloadedBytes: 1, totalBytes: 1 });
@@ -415,7 +452,7 @@ function App() {
 
         {error && <div class="error-banner" role="alert"><strong>{t("error")}</strong><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
 
-        {tab === "record" && <RecordView t={t} settings={settings} recording={recording} transcription={transcription} model={model} liveSegments={liveTranscript.segments} liveTranslations={liveTranscript.translations} busy={busy} isActive={isActive} update={update} changeSource={changeAudioSource} start={startRecording} stop={stopRecording} />}
+        {tab === "record" && <RecordView t={t} settings={settings} recording={recording} transcription={transcription} model={model} liveSegments={liveTranscript.segments} liveTranslations={liveTranscript.translations} busy={busy} isActive={isActive} changeLanguages={changeRecordingLanguages} changeSource={changeAudioSource} start={startRecording} stop={stopRecording} />}
         {tab === "history" && <HistoryView t={t} locale={locale} history={history} refresh={() => void refreshHistory()} open={(sessionId) => void invoke("open_recording_directory", { sessionId }).catch((reason) => setError(String(reason)))} remove={(sessionId) => void deleteRecording(sessionId)} />}
         {tab === "settings" && <SettingsView t={t} settings={settings} models={models} busy={busy || isActive} modelTransitioning={modelTransitioning} saved={saved} update={update} save={() => void saveSettings()} model={model} selectModel={(modelId) => void selectModel(modelId)} installModel={installModel} cancelModel={() => void cancelModel()} chooseOutputDirectory={() => void chooseOutputDirectory()} />}
       </main>
@@ -429,30 +466,29 @@ function NavButton({ active, icon, label, onClick }: { active: boolean; icon: Ic
 
 interface ViewProps { t: ReturnType<typeof translator> }
 
-function RecordView({ t, settings, recording, transcription, model, liveSegments, liveTranslations, busy, isActive, update, changeSource, start, stop }: ViewProps & {
+function RecordView({ t, settings, recording, transcription, model, liveSegments, liveTranslations, busy, isActive, changeLanguages, changeSource, start, stop }: ViewProps & {
   settings: AppSettings; recording: RecordingStatus; transcription: TranscriptionStatus; model: ModelDownloadStatus; liveSegments: TranscriptSegment[]; liveTranslations: TranslationSegment[]; busy: boolean; isActive: boolean;
-  update: (mutate: (next: AppSettings) => void) => void; changeSource: (source: AudioSourceMode) => void; start: () => void; stop: () => void;
+  changeLanguages: (recognitionLanguage: string, translationEnabled: boolean, translationTargetLanguage: string) => void; changeSource: (source: AudioSourceMode) => void; start: () => void; stop: () => void;
 }) {
   const currentSource = recording.phase === "recording" ? recording.audioSource : settings.audio.source;
   const sourceSwitchingDisabled = busy || recording.phase === "starting" || recording.phase === "stopping";
+  const languageSwitchingDisabled = busy || recording.phase === "starting" || recording.phase === "stopping";
   return <div class="view-stack">
     <section class={`record-card ${isActive ? "active" : ""}`}>
       <div class="record-summary"><span class="record-label">{isActive ? t("recording") : t("ready")}</span><strong class="timer">{formatDuration(recording.elapsedMs)}</strong><span class="session-meta">{recording.segmentCount} {t("segments").toLowerCase()}</span></div>
-      <Waveform microphone={recording.microphoneWaveform} system={recording.systemWaveform} active={isActive} />
+      <label class="record-source transcript-control">
+        <span>{t("source")}</span>
+        <select disabled={sourceSwitchingDisabled} value={currentSource} onChange={(event) => changeSource(event.currentTarget.value as AudioSourceMode)}><option value="mixed">{t("mixed")}</option><option value="microphone">{t("microphone")}</option><option value="system">{t("system")}</option></select>
+      </label>
+      <div class="record-signal" role="group" aria-label={t("liveSignal")}>
+        <div class="record-signal-heading"><strong>{t("liveSignal")}</strong><span>{t("voiceActivity")}: <b>{Math.round(recording.vadProbability * 100)}%</b></span></div>
+        <Level label={t("microphone")} value={recording.microphoneDb} muted={currentSource === "system"} />
+        <Level label={t("system")} value={recording.systemDb} muted={currentSource === "microphone"} />
+      </div>
       <button class={`record-button ${isActive ? "stop" : ""}`} disabled={busy} onClick={isActive ? stop : start}><span class="record-button-icon" />{isActive ? t("stop") : t("start")}</button>
     </section>
 
-    <LiveTranscriptPanel t={t} segments={liveSegments} translations={liveTranslations} settings={settings} transcription={transcription} model={model} disabled={isActive} update={update} />
-
-    <section class="quick-grid">
-      <label class="field"><span>{t("source")}</span><select disabled={sourceSwitchingDisabled} value={currentSource} onChange={(event) => changeSource(event.currentTarget.value as AudioSourceMode)}><option value="mixed">{t("mixed")}</option><option value="microphone">{t("microphone")}</option><option value="system">{t("system")}</option></select></label>
-    </section>
-
-    <section class="panel-card">
-      <div class="section-heading"><div><span class="section-icon"><Icon name="wave" /></span><div><h2>{t("liveSignal")}</h2><p>{t("voiceActivity")}: {Math.round(recording.vadProbability * 100)}%</p></div></div></div>
-      <Level label={t("microphone")} value={recording.microphoneDb} muted={currentSource === "system"} />
-      <Level label={t("system")} value={recording.systemDb} muted={currentSource === "microphone"} />
-    </section>
+    <LiveTranscriptPanel t={t} segments={liveSegments} translations={liveTranslations} settings={settings} transcription={transcription} model={model} disabled={languageSwitchingDisabled} changeLanguages={changeLanguages} />
 
   </div>;
 }
@@ -461,14 +497,14 @@ const TRANSCRIPT_MIN_HEIGHT = 120;
 const TRANSCRIPT_MAX_HEIGHT = 520;
 const TRANSCRIPT_HEIGHT_STEP = 24;
 
-function LiveTranscriptPanel({ t, segments, translations, settings, transcription, model, disabled, update }: ViewProps & {
+function LiveTranscriptPanel({ t, segments, translations, settings, transcription, model, disabled, changeLanguages }: ViewProps & {
   segments: TranscriptSegment[];
   translations: TranslationSegment[];
   settings: AppSettings;
   transcription: TranscriptionStatus;
   model: ModelDownloadStatus;
   disabled: boolean;
-  update: (mutate: (next: AppSettings) => void) => void;
+  changeLanguages: (recognitionLanguage: string, translationEnabled: boolean, translationTargetLanguage: string) => void;
 }) {
   const [height, setHeight] = useState(220);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -516,14 +552,15 @@ function LiveTranscriptPanel({ t, segments, translations, settings, transcriptio
   };
 
   const updateTranslationLanguage = (value: string) => {
-    update((next) => {
-      next.translation.enabled = value !== "off";
-      if (value !== "off") next.translation.targetLanguage = value;
-    });
+    changeLanguages(
+      settings.transcription.language,
+      value !== "off",
+      value === "off" ? settings.translation.targetLanguage : value,
+    );
   };
 
   return <section class="panel-card transcript-panel">
-    <div class="section-heading"><div><span class="section-icon"><Icon name="text" /></span><div><h2>{t("liveTranscript")}</h2><p>{t("liveTranscriptHint")}</p></div></div><div class="transcript-heading-meta"><TranscriptionBadge t={t} status={transcription} model={model} /><div class="transcript-controls"><label class="transcript-control"><span>{t("recognitionLanguage")}</span><select disabled={disabled} value={settings.transcription.language} onChange={(event) => update((next) => { next.transcription.language = event.currentTarget.value; })}><option value="auto">Auto</option><option value="zh-CN">{t("languageChineseShort")}</option><option value="Japanese">{t("languageJapaneseShort")}</option><option value="en-US">{t("languageEnglishShort")}</option></select></label><label class="transcript-control"><span>{t("translationLanguage")}</span><select disabled={disabled} value={settings.translation.enabled ? settings.translation.targetLanguage : "off"} onChange={(event) => updateTranslationLanguage(event.currentTarget.value)}><option value="off">{t("noTranslation")}</option><option value="Chinese">{t("languageChineseShort")}</option><option value="Japanese">{t("languageJapaneseShort")}</option><option value="English">{t("languageEnglishShort")}</option></select></label></div>{segments.length > 0 && <span class="transcript-count">{segments.length}</span>}</div></div>
+    <div class="section-heading"><div><span class="section-icon"><Icon name="text" /></span><div><h2>{t("liveTranscript")}</h2><p>{t("liveTranscriptHint")}</p></div></div><div class="transcript-heading-meta"><TranscriptionBadge t={t} status={transcription} model={model} /><div class="transcript-controls"><label class="transcript-control"><span>{t("recognitionLanguage")}</span><select disabled={disabled} value={settings.transcription.language} onChange={(event) => changeLanguages(event.currentTarget.value, settings.translation.enabled, settings.translation.targetLanguage)}><option value="auto">Auto</option><option value="zh-CN">{t("languageChineseShort")}</option><option value="Japanese">{t("languageJapaneseShort")}</option><option value="en-US">{t("languageEnglishShort")}</option></select></label><label class="transcript-control"><span>{t("translationLanguage")}</span><select disabled={disabled} value={settings.translation.enabled ? settings.translation.targetLanguage : "off"} onChange={(event) => updateTranslationLanguage(event.currentTarget.value)}><option value="off">{t("noTranslation")}</option><option value="Chinese">{t("languageChineseShort")}</option><option value="Japanese">{t("languageJapaneseShort")}</option><option value="English">{t("languageEnglishShort")}</option></select></label></div></div></div>
     <div class="transcript-scroll" style={{ height: `${height}px` }} ref={scrollRef} onScroll={trackScroll} aria-live="polite" aria-relevant="additions text">
       {segments.length === 0
         ? <p class="transcript-empty">{t("liveTranscriptEmpty")}</p>
@@ -538,18 +575,9 @@ function TranscriptionBadge({ t, status, model }: ViewProps & { status: Transcri
     const label = model.phase === "downloading" ? t("modelDownloading") : t("modelMissing");
     return <span class={`transcription-badge model-${model.phase}`} title={model.error ?? label} aria-live="polite"><i />{label}</span>;
   }
-  if (status.phase === "idle" && status.pendingSegments === 0) return null;
-  const label = status.phase === "waitingForModel"
-    ? t("waitingModel")
-    : status.phase === "loadingModel"
-      ? t("modelLoading")
-      : status.phase === "transcribing"
-        ? t("transcribing")
-        : status.phase === "failed"
-          ? t("transcriptionFailed")
-          : t("pendingSegments");
-  const pending = status.pendingSegments > 0 ? ` · ${status.pendingSegments}` : "";
-  return <span class={`transcription-badge ${status.phase}`} title={status.error ?? label} aria-live="polite"><i />{label}{pending}</span>;
+  if (status.phase !== "failed") return null;
+  const label = t("transcriptionFailed");
+  return <span class="transcription-badge failed" title={status.error ?? label} aria-live="polite"><i />{label}</span>;
 }
 
 function HistoryView({ t, locale, history, refresh, open, remove }: ViewProps & { locale: string; history: HistoryEntry[]; refresh: () => void; open: (id: string) => void; remove: (id: string) => void }) {
@@ -617,8 +645,12 @@ function TextField({ label, value, onChange, type = "text", disabled = false, cl
 function NumberField({ label, value, min, max, onChange }: { label: string; value: number; min: number; max: number; onChange: (value: number) => void }) { return <label class="field"><span>{label}</span><input type="number" value={value} min={min} max={max} onChange={(event) => onChange(Number(event.currentTarget.value))} /></label>; }
 function RangeField({ label, value, min, max, step, suffix, onChange }: { label: string; value: number; min: number; max: number; step: number; suffix: string; onChange: (value: number) => void }) { return <label class="range-field"><span><b>{label}</b><em>{value.toFixed(step < 0.1 ? 2 : 1)}{suffix}</em></span><input type="range" value={value} min={min} max={max} step={step} onInput={(event) => onChange(Number(event.currentTarget.value))} /></label>; }
 function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) { return <label class="toggle-row"><span>{label}</span><input type="checkbox" checked={checked} onChange={(event) => onChange(event.currentTarget.checked)} /><i /></label>; }
-function Level({ label, value, muted }: { label: string; value: number; muted: boolean }) { const width = muted ? 0 : Math.max(0, Math.min(100, (value + 80) / 80 * 100)); return <div class={`level-row ${muted ? "muted" : ""}`}><span>{label}</span><div class="level-track"><i style={{ width: `${width}%` }} /></div><em>{muted ? "—" : `${Math.round(value)} dB`}</em></div>; }
-function Waveform({ microphone, system, active }: { microphone: number[]; system: number[]; active: boolean }) { const count = Math.max(microphone.length, system.length); return <div class={`waveform ${active ? "active" : ""}`} aria-hidden="true">{Array.from({ length: count }, (_, index) => <span class="waveform-column" key={index}><i class="waveform-microphone" style={{ height: `${Math.max(3, (microphone[index] ?? 0) * 88)}%` }} /><i class="waveform-system" style={{ height: `${Math.max(3, (system[index] ?? 0) * 88)}%` }} /></span>)}</div>; }
+function Level({ label, value, muted }: { label: string; value: number; muted: boolean }) {
+  const normalizedValue = Math.max(-80, Math.min(0, value));
+  const displayValue = muted ? "—" : `${Math.round(value)} dB`;
+  const width = muted ? 0 : (normalizedValue + 80) / 80 * 100;
+  return <div class={`level-row ${muted ? "muted" : ""}`}><span>{label}</span><div class="level-track" role="meter" aria-label={label} aria-valuemin={-80} aria-valuemax={0} aria-valuenow={muted ? undefined : Math.round(normalizedValue)} aria-valuetext={displayValue} aria-disabled={muted}><i style={{ width: `${width}%` }} /></div><em>{displayValue}</em></div>;
+}
 
 function sourceLabel(t: ReturnType<typeof translator>, source: HistoryEntry["audioSource"]) { return t(source); }
 function segmentText(t: ReturnType<typeof translator>, segment: TranscriptSegment) {

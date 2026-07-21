@@ -15,7 +15,7 @@ use crate::{
     models::{ModelError, ModelManager},
     settings::{AudioSettings, AudioSourceMode, TranscriptionSettings, TranslationSettings},
     storage::{RecordingArchive, SessionManifest, StorageError, recover_interrupted_sessions},
-    transcription::TranscriptionService,
+    transcription::{TranscriptionError, TranscriptionService},
     vad::VadError,
 };
 
@@ -87,6 +87,12 @@ pub struct RecordingService {
     observer: StatusObserver,
     status: Arc<RwLock<RecordingStatus>>,
     transcription: Option<Arc<TranscriptionService>>,
+}
+
+#[derive(Clone)]
+pub(super) struct RecordingTranscriptionConfig {
+    pub(super) transcription: TranscriptionSettings,
+    pub(super) translation: TranslationSettings,
 }
 
 impl RecordingService {
@@ -178,8 +184,8 @@ impl RecordingService {
             audio_source: settings.source,
             microphone_device,
             phase: RecordingPhase::Recording,
-            session_directory: Some(session_directory),
-            session_id: Some(session_id),
+            session_directory: Some(session_directory.clone()),
+            session_id: Some(session_id.clone()),
             system_device,
             ..RecordingStatus::default()
         };
@@ -188,14 +194,17 @@ impl RecordingService {
         let status = self.status.clone();
         let observer = self.observer.clone();
         let transcription = self.transcription.clone();
+        let transcription_config = Arc::new(RwLock::new(RecordingTranscriptionConfig {
+            transcription: transcription_settings,
+            translation: translation_settings,
+        }));
         let context = RecordingWorkerContext {
             observer,
             settings: settings.clone(),
             source: source.clone(),
             status,
             transcription,
-            transcription_settings,
-            translation_settings,
+            transcription_config: transcription_config.clone(),
             vad_model,
         };
         let worker = thread::Builder::new()
@@ -214,8 +223,11 @@ impl RecordingService {
         *active = Some(ActiveRecording {
             capture_sender,
             sessions,
+            session_directory,
+            session_id,
             source,
             stop_sender,
+            transcription_config,
             worker,
         });
         Ok(recording_status)
@@ -252,6 +264,46 @@ impl RecordingService {
             status.system_device = system_device;
         });
         Ok(self.status())
+    }
+
+    pub fn set_languages(
+        &self,
+        recognition_language: String,
+        translation_enabled: bool,
+        translation_target_language: String,
+    ) -> Result<(), RecordingError> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reap_finished(&mut active);
+        let Some(recording) = active.as_ref() else {
+            return Err(RecordingError::NotRecording);
+        };
+        let transcription_config = recording.transcription_config.clone();
+        let session_directory = recording.session_directory.clone();
+        let session_id = recording.session_id.clone();
+        drop(active);
+
+        let mut config = transcription_config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = config.clone();
+        config.transcription.language = recognition_language;
+        config.translation.enabled = translation_enabled;
+        config.translation.target_language = translation_target_language;
+        if let Some(transcription) = &self.transcription {
+            if let Err(error) = transcription.update_session_languages(
+                &session_directory,
+                &session_id,
+                &config.transcription,
+                &config.translation,
+            ) {
+                *config = previous;
+                return Err(error.into());
+            }
+        }
+        Ok(())
     }
 
     pub fn stop(&self) -> Result<RecordingStatus, RecordingError> {
@@ -318,8 +370,11 @@ impl RecordingService {
 struct ActiveRecording {
     capture_sender: Sender<CaptureEvent>,
     sessions: Vec<CaptureSession>,
+    session_directory: PathBuf,
+    session_id: String,
     source: Arc<RwLock<AudioSourceMode>>,
     stop_sender: Sender<()>,
+    transcription_config: Arc<RwLock<RecordingTranscriptionConfig>>,
     worker: JoinHandle<Result<SessionManifest, RecordingError>>,
 }
 
@@ -406,6 +461,8 @@ pub enum RecordingError {
     },
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Transcription(#[from] TranscriptionError),
     #[error("failed to start recording worker: {0}")]
     Thread(std::io::Error),
     #[error(transparent)]
