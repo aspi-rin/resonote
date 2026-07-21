@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { render } from "preact";
-import { useEffect, useMemo, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { resolveLanguage, translator, type TranslationKey } from "./i18n";
 import {
   DEFAULT_MODEL_STATUS,
@@ -14,6 +14,9 @@ import {
   type HistoryEntry,
   type ModelDownloadStatus,
   type RecordingStatus,
+  type TranscriptDocument,
+  type TranscriptSegment,
+  type TranscriptSegmentUpdate,
   type TranscriptionStatus,
 } from "./types";
 import "./styles.css";
@@ -28,8 +31,14 @@ type IconName =
   | "mic"
   | "refresh"
   | "shield"
+  | "text"
   | "trash"
   | "wave";
+
+interface LiveTranscript {
+  segments: TranscriptSegment[];
+  sessionId: string | null;
+}
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 
@@ -43,6 +52,7 @@ function Icon({ name }: { name: IconName }) {
     mic: <><rect x="8" y="3" width="8" height="12" rx="4"/><path d="M5 11a7 7 0 0 0 14 0m-7 7v3m-4 0h8"/></>,
     refresh: <><path d="M20 7v5h-5"/><path d="M19 12a7 7 0 1 0-2 5"/></>,
     shield: <path d="M12 2 4 5v6c0 5 3.4 8.6 8 11 4.6-2.4 8-6 8-11V5z"/>,
+    text: <path d="M4 6h16M4 11h16M4 16h10"/>,
     trash: <><path d="M4 7h16m-10 4v6m4-6v6M9 7l1-3h4l1 3m3 0-1 14H7L6 7"/></>,
     wave: <path d="M3 12h2l2-7 3 14 3-11 2 8 2-4h4"/>,
   };
@@ -56,6 +66,8 @@ function App() {
   const [recording, setRecording] = useState<RecordingStatus>(DEFAULT_RECORDING_STATUS);
   const [model, setModel] = useState<ModelDownloadStatus>(DEFAULT_MODEL_STATUS);
   const [transcription, setTranscription] = useState<TranscriptionStatus>(DEFAULT_TRANSCRIPTION_STATUS);
+  const [liveTranscript, setLiveTranscript] = useState<LiveTranscript>({ segments: [], sessionId: null });
+  const liveTranscriptSession = useRef<string | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [version, setVersion] = useState("0.1.0");
   const [loading, setLoading] = useState(true);
@@ -90,6 +102,7 @@ function App() {
         ]);
       setSettings(loadedSettings);
       setDevices(loadedDevices);
+      liveTranscriptSession.current = loadedRecording.sessionId;
       setRecording(loadedRecording);
       setModel(loadedModel);
       setTranscription(loadedTranscription);
@@ -112,11 +125,22 @@ function App() {
     const subscriptions: UnlistenFn[] = [];
     void Promise.all([
       listen<RecordingStatus>("recording-status", (event) => {
+        if (event.payload.sessionId) liveTranscriptSession.current = event.payload.sessionId;
         setRecording(event.payload);
         if (event.payload.phase === "idle") void refreshHistory();
       }),
       listen<ModelDownloadStatus>("model-download-status", (event) => setModel(event.payload)),
       listen<TranscriptionStatus>("transcription-status", (event) => setTranscription(event.payload)),
+      listen<TranscriptSegmentUpdate>("transcript-segment", (event) => {
+        setLiveTranscript((current) => {
+          if (liveTranscriptSession.current !== event.payload.sessionId) return current;
+          const segments = current.sessionId === event.payload.sessionId ? current.segments : [];
+          return {
+            segments: upsertSegment(segments, event.payload.segment),
+            sessionId: event.payload.sessionId,
+          };
+        });
+      }),
     ]).then((unlisteners) => {
       if (disposed) unlisteners.forEach((unlisten) => unlisten());
       else subscriptions.push(...unlisteners);
@@ -126,6 +150,24 @@ function App() {
       subscriptions.forEach((unlisten) => unlisten());
     };
   }, []);
+
+  useEffect(() => {
+    const sessionId = recording.sessionId;
+    if (!sessionId) return;
+    liveTranscriptSession.current = sessionId;
+    setLiveTranscript((current) => (current.sessionId === sessionId ? current : { segments: [], sessionId }));
+    if (!isTauri) return;
+    // Seed from disk so a window reload or crash recovery does not lose earlier sentences.
+    void invoke<TranscriptDocument | null>("get_session_transcript", { sessionId })
+      .then((document) => {
+        if (!document) return;
+        setLiveTranscript((current) => {
+          if (current.sessionId !== sessionId) return current;
+          return { segments: mergeSegments(document.segments, current.segments), sessionId };
+        });
+      })
+      .catch((reason) => console.warn("failed to seed live transcript", reason));
+  }, [recording.sessionId]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -168,7 +210,9 @@ function App() {
       }
       const persisted = await invoke<AppSettings>("save_settings", { settings });
       setSettings(persisted);
-      setRecording(await invoke<RecordingStatus>("start_recording"));
+      const started = await invoke<RecordingStatus>("start_recording");
+      liveTranscriptSession.current = started.sessionId;
+      setRecording(started);
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -261,7 +305,7 @@ function App() {
 
         {error && <div class="error-banner" role="alert"><strong>{t("error")}</strong><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
 
-        {tab === "record" && <RecordView t={t} settings={settings} recording={recording} transcription={transcription} model={model} busy={busy} isActive={isActive} update={update} start={startRecording} stop={stopRecording} installModel={installModel} cancelModel={() => void invoke("cancel_model_install")} />}
+        {tab === "record" && <RecordView t={t} settings={settings} recording={recording} transcription={transcription} model={model} liveSegments={liveTranscript.segments} busy={busy} isActive={isActive} update={update} start={startRecording} stop={stopRecording} installModel={installModel} cancelModel={() => void invoke("cancel_model_install")} />}
         {tab === "history" && <HistoryView t={t} locale={locale} history={history} refresh={() => void refreshHistory()} open={(sessionId) => void invoke("open_recording_directory", { sessionId }).catch((reason) => setError(String(reason)))} remove={(sessionId) => void deleteRecording(sessionId)} />}
         {tab === "settings" && <SettingsView t={t} settings={settings} devices={devices} busy={busy || isActive} saved={saved} update={update} save={() => void saveSettings()} model={model} installModel={installModel} chooseOutputDirectory={() => void chooseOutputDirectory()} />}
       </main>
@@ -275,8 +319,8 @@ function NavButton({ active, icon, label, onClick }: { active: boolean; icon: Ic
 
 interface ViewProps { t: ReturnType<typeof translator> }
 
-function RecordView({ t, settings, recording, transcription, model, busy, isActive, update, start, stop, installModel, cancelModel }: ViewProps & {
-  settings: AppSettings; recording: RecordingStatus; transcription: TranscriptionStatus; model: ModelDownloadStatus; busy: boolean; isActive: boolean;
+function RecordView({ t, settings, recording, transcription, model, liveSegments, busy, isActive, update, start, stop, installModel, cancelModel }: ViewProps & {
+  settings: AppSettings; recording: RecordingStatus; transcription: TranscriptionStatus; model: ModelDownloadStatus; liveSegments: TranscriptSegment[]; busy: boolean; isActive: boolean;
   update: (mutate: (next: AppSettings) => void) => void; start: () => void; stop: () => void; installModel: () => void; cancelModel: () => void;
 }) {
   const progress = model.totalBytes > 0 ? Math.min(100, model.downloadedBytes / model.totalBytes * 100) : 0;
@@ -286,6 +330,8 @@ function RecordView({ t, settings, recording, transcription, model, busy, isActi
       <Waveform microphone={recording.microphoneWaveform} system={recording.systemWaveform} active={isActive} />
       <button class={`record-button ${isActive ? "stop" : ""}`} disabled={busy} onClick={isActive ? stop : start}><span class="record-button-icon" />{isActive ? t("stop") : t("start")}</button>
     </section>
+
+    <LiveTranscriptPanel t={t} segments={liveSegments} />
 
     <section class="quick-grid">
       <label class="field"><span>{t("source")}</span><select disabled={isActive} value={settings.audio.source} onChange={(event) => update((next) => { next.audio.source = event.currentTarget.value as AppSettings["audio"]["source"]; })}><option value="mixed">{t("mixed")}</option><option value="microphone">{t("microphone")}</option><option value="system">{t("system")}</option></select></label>
@@ -302,6 +348,67 @@ function RecordView({ t, settings, recording, transcription, model, busy, isActi
       {model.phase === "downloading" ? <><div class="progress-track"><i style={{ width: `${progress}%` }} /></div><div class="progress-meta"><span>{model.currentFile ?? t("modelFile")}</span><span>{formatBytes(model.downloadedBytes)} / {formatBytes(model.totalBytes)}</span></div><button class="secondary-button" onClick={cancelModel}>{t("cancel")}</button></> : model.phase !== "downloaded" ? <button class="secondary-button accent" onClick={installModel}>{t("downloadModel")}</button> : <div class="model-ready"><Icon name="check" /><span>{t("modelReady")}</span>{transcription.pendingSegments > 0 && <em>{transcription.pendingSegments} {t("pendingSegments").toLowerCase()}</em>}</div>}
     </section>
   </div>;
+}
+
+const TRANSCRIPT_MIN_HEIGHT = 120;
+const TRANSCRIPT_MAX_HEIGHT = 520;
+const TRANSCRIPT_HEIGHT_STEP = 24;
+
+function LiveTranscriptPanel({ t, segments }: ViewProps & { segments: TranscriptSegment[] }) {
+  const [height, setHeight] = useState(220);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const pinnedToBottom = useRef(true);
+
+  useEffect(() => {
+    const scroller = scrollRef.current;
+    if (scroller && pinnedToBottom.current) scroller.scrollTop = scroller.scrollHeight;
+  }, [segments]);
+
+  const trackScroll = () => {
+    const scroller = scrollRef.current;
+    if (scroller) pinnedToBottom.current = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 24;
+  };
+
+  const clampHeight = (value: number) => Math.min(TRANSCRIPT_MAX_HEIGHT, Math.max(TRANSCRIPT_MIN_HEIGHT, value));
+
+  const beginResize = (event: preact.JSX.TargetedPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const handle = event.currentTarget;
+    const startY = event.clientY;
+    const startHeight = height;
+    handle.focus();
+    handle.setPointerCapture(event.pointerId);
+    const move = (pointer: PointerEvent) => setHeight(clampHeight(startHeight + pointer.clientY - startY));
+    const finish = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", finish);
+      handle.removeEventListener("pointercancel", finish);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", finish);
+    handle.addEventListener("pointercancel", finish);
+  };
+
+  const nudgeResize = (event: preact.JSX.TargetedKeyboardEvent<HTMLDivElement>) => {
+    if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    if (event.key === "Home") setHeight(TRANSCRIPT_MIN_HEIGHT);
+    else if (event.key === "End") setHeight(TRANSCRIPT_MAX_HEIGHT);
+    else {
+      const delta = event.key === "ArrowUp" ? -TRANSCRIPT_HEIGHT_STEP : TRANSCRIPT_HEIGHT_STEP;
+      setHeight((current) => clampHeight(current + delta));
+    }
+  };
+
+  return <section class="panel-card transcript-panel">
+    <div class="section-heading"><div><span class="section-icon"><Icon name="text" /></span><div><h2>{t("liveTranscript")}</h2><p>{t("liveTranscriptHint")}</p></div></div>{segments.length > 0 && <span class="transcript-count">{segments.length}</span>}</div>
+    <div class="transcript-scroll" style={{ height: `${height}px` }} ref={scrollRef} onScroll={trackScroll} aria-live="polite" aria-relevant="additions text">
+      {segments.length === 0
+        ? <p class="transcript-empty">{t("liveTranscriptEmpty")}</p>
+        : <ol class="transcript-list">{segments.map((segment) => <li class={`transcript-row ${segment.status}`} key={segment.id}><time>{formatDuration(segment.startMs)}</time><span>{segmentText(t, segment)}</span></li>)}</ol>}
+    </div>
+    <div class="transcript-resize" role="separator" aria-orientation="horizontal" aria-label={t("resizeTranscript")} aria-valuemin={TRANSCRIPT_MIN_HEIGHT} aria-valuemax={TRANSCRIPT_MAX_HEIGHT} aria-valuenow={height} tabIndex={0} onPointerDown={beginResize} onKeyDown={nudgeResize} />
+  </section>;
 }
 
 function HistoryView({ t, locale, history, refresh, open, remove }: ViewProps & { locale: string; history: HistoryEntry[]; refresh: () => void; open: (id: string) => void; remove: (id: string) => void }) {
@@ -339,6 +446,30 @@ function Level({ label, value, muted }: { label: string; value: number; muted: b
 function Waveform({ microphone, system, active }: { microphone: number[]; system: number[]; active: boolean }) { const count = Math.max(microphone.length, system.length); return <div class={`waveform ${active ? "active" : ""}`} aria-hidden="true">{Array.from({ length: count }, (_, index) => <span class="waveform-column" key={index}><i class="waveform-microphone" style={{ height: `${Math.max(3, (microphone[index] ?? 0) * 88)}%` }} /><i class="waveform-system" style={{ height: `${Math.max(3, (system[index] ?? 0) * 88)}%` }} /></span>)}</div>; }
 
 function sourceLabel(t: ReturnType<typeof translator>, source: HistoryEntry["audioSource"]) { return t(source); }
+function segmentText(t: ReturnType<typeof translator>, segment: TranscriptSegment) {
+  if (segment.status === "complete") return segment.text.trim() || "…";
+  if (segment.status === "failed") return t("transcriptFailed");
+  return `${t("transcribing")}…`;
+}
+// A snapshot supersedes another one for the same segment when it reflects a later
+// transcription attempt, or a later stage of the same attempt.
+const SEGMENT_STATUS_RANK: Record<TranscriptSegment["status"], number> = { pending: 0, processing: 1, complete: 2, failed: 2 };
+function isNewerSegment(candidate: TranscriptSegment, existing: TranscriptSegment) {
+  if (candidate.attempts !== existing.attempts) return candidate.attempts > existing.attempts;
+  return SEGMENT_STATUS_RANK[candidate.status] >= SEGMENT_STATUS_RANK[existing.status];
+}
+function upsertSegment(segments: TranscriptSegment[], incoming: TranscriptSegment) {
+  const index = segments.findIndex((segment) => segment.id === incoming.id);
+  if (index < 0) return [...segments, incoming].sort((a, b) => a.id - b.id);
+  if (!isNewerSegment(incoming, segments[index])) return segments;
+  const next = [...segments];
+  next[index] = incoming;
+  return next;
+}
+function mergeSegments(fetched: TranscriptSegment[], received: TranscriptSegment[]) {
+  const base = [...fetched].sort((a, b) => a.id - b.id);
+  return received.reduce(upsertSegment, base);
+}
 function transcriptionLabel(t: ReturnType<typeof translator>, transcription: TranscriptionStatus, model: ModelDownloadStatus) { if (model.phase === "missing" || model.phase === "failed" || model.phase === "cancelled") return t("modelMissing"); if (model.phase === "downloading") return t("modelDownloading"); if (transcription.phase === "loadingModel") return t("modelLoading"); if (transcription.phase === "transcribing") return t("transcribing"); if (transcription.phase === "waitingForModel") return t("waitingModel"); return t("modelReady"); }
 function formatDuration(milliseconds: number) { const total = Math.floor(milliseconds / 1000); const hours = Math.floor(total / 3600); const minutes = Math.floor(total % 3600 / 60); const seconds = total % 60; return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`; }
 function formatBytes(bytes: number) { if (bytes <= 0) return "0 B"; const units = ["B", "KB", "MB", "GB"]; const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024))); return `${(bytes / 1024 ** index).toFixed(index > 1 ? 1 : 0)} ${units[index]}`; }

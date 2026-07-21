@@ -24,7 +24,9 @@ use history::{HistoryEntry, HistoryService};
 use models::{ModelDownloadStatus, ModelManager};
 use recording::{RecordingService, RecordingStatus};
 use settings::{AppSettings, SettingsStore};
-use transcription::{TranscriptionService, TranscriptionStatus};
+use transcription::{
+    TranscriptDocument, TranscriptSegmentUpdate, TranscriptionService, TranscriptionStatus,
+};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -148,6 +150,16 @@ fn get_transcription_status(
     state.status()
 }
 
+#[tauri::command]
+fn get_session_transcript(
+    state: tauri::State<'_, HistoryService>,
+    session_id: String,
+) -> Result<Option<TranscriptDocument>, String> {
+    state
+        .session_transcript(&session_id)
+        .map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -201,9 +213,16 @@ pub fn run() {
                     tracing::debug!(?error, "transcription status event had no listener");
                 }
             });
-            let transcription = Arc::new(TranscriptionService::with_observer(
+            let segment_event_app = app.handle().clone();
+            let segment_observer = Arc::new(move |update: TranscriptSegmentUpdate| {
+                if let Err(error) = segment_event_app.emit("transcript-segment", update) {
+                    tracing::debug!(?error, "transcript segment event had no listener");
+                }
+            });
+            let transcription = Arc::new(TranscriptionService::with_observers(
                 model_manager.clone(),
                 transcription_observer,
+                segment_observer,
             ));
             let recovered_transcripts = transcription.recover_root(&recordings_root)?;
             if recovered_transcripts > 0 {
@@ -250,6 +269,7 @@ pub fn run() {
             get_settings,
             get_model_status,
             get_recording_status,
+            get_session_transcript,
             get_transcription_status,
             install_model,
             list_audio_devices,

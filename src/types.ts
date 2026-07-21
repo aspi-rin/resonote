@@ -72,6 +72,39 @@ export interface ModelDownloadStatus {
   totalBytes: number;
 }
 
+export type TranscriptSegmentStatus = "pending" | "processing" | "complete" | "failed";
+export type TranscriptDocumentStatus = "pending" | "processing" | "complete" | "partial";
+
+export interface TranscriptSegment {
+  attempts: number;
+  audioFile: string;
+  detectedLanguage: string;
+  endMs: number;
+  error: string | null;
+  id: number;
+  peakProbability: number;
+  startMs: number;
+  status: TranscriptSegmentStatus;
+  text: string;
+}
+
+export interface TranscriptSegmentUpdate {
+  segment: TranscriptSegment;
+  sessionId: string;
+}
+
+export interface TranscriptDocument {
+  forcedLanguage: string;
+  modelId: string;
+  schemaVersion: number;
+  segments: TranscriptSegment[];
+  sessionId: string;
+  status: TranscriptDocumentStatus;
+  threads: number;
+  unloadAfterIdleMinutes: number;
+  updatedAt: string;
+}
+
 export interface TranscriptionStatus {
   currentSessionId: string | null;
   error: string | null;
@@ -117,7 +150,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   transcription: {
     language: "auto",
     modelId: "qwen3-asr-0.6b-int8",
-    threads: 2,
+    threads: 6,
     unloadAfterIdleMinutes: 10,
     vad: {
       activationThreshold: 0.5,

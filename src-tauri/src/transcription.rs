@@ -24,6 +24,7 @@ const DOCUMENT_NAME: &str = "transcript.json";
 const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub type TranscriptionObserver = Arc<dyn Fn(TranscriptionStatus) + Send + Sync + 'static>;
+pub type SegmentObserver = Arc<dyn Fn(TranscriptSegmentUpdate) + Send + Sync + 'static>;
 
 #[path = "transcription_delete.rs"]
 mod deletion;
@@ -32,7 +33,7 @@ mod document;
 
 pub use document::{
     TranscriptDocument, TranscriptDocumentStatus, TranscriptSegment, TranscriptSegmentStatus,
-    TranscriptionPhase, TranscriptionStatus,
+    TranscriptSegmentUpdate, TranscriptionPhase, TranscriptionStatus,
 };
 use document::{
     collect_documents, is_retryable, load_document, qwen_language, sample_to_ms, save_document,
@@ -49,21 +50,31 @@ struct TranscriptionInner {
     known_sessions: Mutex<HashSet<PathBuf>>,
     manager: Arc<ModelManager>,
     observer: TranscriptionObserver,
+    segment_observer: SegmentObserver,
     status: RwLock<TranscriptionStatus>,
     stop: AtomicBool,
 }
 
 impl TranscriptionService {
     pub fn new(manager: Arc<ModelManager>) -> Self {
-        Self::with_observer(manager, Arc::new(|_| {}))
+        Self::with_observers(manager, Arc::new(|_| {}), Arc::new(|_| {}))
     }
 
     pub fn with_observer(manager: Arc<ModelManager>, observer: TranscriptionObserver) -> Self {
+        Self::with_observers(manager, observer, Arc::new(|_| {}))
+    }
+
+    pub fn with_observers(
+        manager: Arc<ModelManager>,
+        observer: TranscriptionObserver,
+        segment_observer: SegmentObserver,
+    ) -> Self {
         let inner = Arc::new(TranscriptionInner {
             document_locks: Mutex::new(HashMap::new()),
             known_sessions: Mutex::new(HashSet::new()),
             manager,
             observer,
+            segment_observer,
             status: RwLock::new(TranscriptionStatus::default()),
             stop: AtomicBool::new(false),
         });
@@ -153,6 +164,7 @@ impl TranscriptionService {
                 status.phase = TranscriptionPhase::WaitingForModel;
             }
         });
+        self.inner.publish_segment(session_id, &item);
         Ok(item)
     }
 
@@ -241,6 +253,13 @@ impl TranscriptionInner {
             status.clone()
         };
         (self.observer)(updated);
+    }
+
+    fn publish_segment(&self, session_id: &str, segment: &TranscriptSegment) {
+        (self.segment_observer)(TranscriptSegmentUpdate {
+            segment: segment.clone(),
+            session_id: session_id.to_owned(),
+        });
     }
 }
 
@@ -340,7 +359,7 @@ fn process_session(
         Err(error) => return Err(error.into()),
     }
     ensure_recognizer(inner, &document, cached)?;
-    let audio_path = {
+    let (audio_path, processing_snapshot) = {
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut latest = load_document(&path)?;
         let item = latest
@@ -352,11 +371,13 @@ fn process_session(
         item.attempts += 1;
         item.error = None;
         let audio_path = session_dir.join(&item.audio_file);
+        let snapshot = item.clone();
         latest.status = TranscriptDocumentStatus::Processing;
         latest.updated_at = Utc::now();
         save_document(&path, &latest)?;
-        audio_path
+        (audio_path, snapshot)
     };
+    inner.publish_segment(&document.session_id, &processing_snapshot);
     inner.publish(|status| {
         status.current_session_id = Some(document.session_id.clone());
         status.error = None;
@@ -393,6 +414,7 @@ fn process_session(
             item.status = TranscriptSegmentStatus::Failed;
         }
     }
+    let resolved_snapshot = item.clone();
     let retryable = latest
         .segments
         .iter()
@@ -411,6 +433,7 @@ fn process_session(
     };
     latest.updated_at = Utc::now();
     save_document(&path, &latest)?;
+    inner.publish_segment(&latest.session_id, &resolved_snapshot);
     inner.publish(|status| {
         status.pending_segments = retryable;
         if retryable == 0 {

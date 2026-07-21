@@ -69,6 +69,14 @@ pub struct TranscriptSegment {
     pub text: String,
 }
 
+/// Snapshot of one segment's persisted state, published whenever it changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptSegmentUpdate {
+    pub segment: TranscriptSegment,
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptDocument {

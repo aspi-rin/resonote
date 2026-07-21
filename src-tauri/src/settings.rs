@@ -109,11 +109,15 @@ impl Default for TranscriptionSettings {
         Self {
             language: "auto".to_owned(),
             model_id: "qwen3-asr-0.6b-int8".to_owned(),
-            threads: 2,
+            threads: default_transcription_threads(),
             unload_after_idle_minutes: 10,
             vad: VadConfig::default(),
         }
     }
+}
+
+const fn default_transcription_threads() -> u16 {
+    if cfg!(target_os = "macos") { 6 } else { 2 }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -232,6 +236,10 @@ mod tests {
         let settings = AppSettings::default();
 
         assert_eq!(settings.audio.source, AudioSourceMode::Mixed);
+        #[cfg(target_os = "macos")]
+        assert_eq!(settings.transcription.threads, 6);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(settings.transcription.threads, 2);
         settings.validate().unwrap();
     }
 

@@ -122,6 +122,25 @@ impl HistoryService {
         }
         Ok(())
     }
+
+    pub fn session_transcript(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<TranscriptDocument>, HistoryError> {
+        if session_id.trim().is_empty() {
+            return Err(HistoryError::InvalidSessionId);
+        }
+        let entry = self
+            .list(MAX_HISTORY_LIMIT)?
+            .into_iter()
+            .find(|entry| entry.session_id == session_id)
+            .ok_or_else(|| HistoryError::SessionNotFound(session_id.to_owned()))?;
+        let transcript_path = entry.directory.join(TRANSCRIPT_NAME);
+        if !transcript_path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&fs::read(transcript_path)?)?))
+    }
 }
 
 fn history_entry(manifest_path: &Path) -> Result<HistoryEntry, HistoryError> {
@@ -293,6 +312,55 @@ mod tests {
 
         assert!(!first_path.exists());
         assert!(second_path.exists());
+    }
+
+    #[test]
+    fn returns_the_transcript_document_for_a_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut archive =
+            RecordingArchive::create(directory.path(), &AudioSettings::default()).unwrap();
+        archive.append(&vec![0.0; 16_000]).unwrap();
+        let session_dir = archive.session_dir().to_path_buf();
+        let manifest = archive.complete().unwrap();
+        let document = TranscriptDocument {
+            forced_language: "auto".to_owned(),
+            model_id: "qwen3-asr-0.6b-int8".to_owned(),
+            schema_version: 1,
+            segments: Vec::new(),
+            session_id: manifest.session_id.clone(),
+            status: TranscriptDocumentStatus::Complete,
+            threads: 2,
+            unload_after_idle_minutes: 10,
+            updated_at: Utc::now(),
+        };
+        fs::write(
+            session_dir.join(TRANSCRIPT_NAME),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        let service = HistoryService::new(directory.path().to_path_buf());
+
+        let fetched = service
+            .session_transcript(&manifest.session_id)
+            .unwrap()
+            .expect("transcript document exists");
+
+        assert_eq!(fetched.session_id, manifest.session_id);
+        assert_eq!(fetched.status, TranscriptDocumentStatus::Complete);
+    }
+
+    #[test]
+    fn reports_a_missing_transcript_as_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive =
+            RecordingArchive::create(directory.path(), &AudioSettings::default()).unwrap();
+        let manifest = archive.complete().unwrap();
+        let service = HistoryService::new(directory.path().to_path_buf());
+
+        assert_eq!(
+            service.session_transcript(&manifest.session_id).unwrap(),
+            None
+        );
     }
 
     #[test]
