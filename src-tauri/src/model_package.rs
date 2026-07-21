@@ -7,23 +7,13 @@ use bzip2::read::BzDecoder;
 
 use crate::models::ModelError;
 
-const MODEL_DIRECTORY: &str = "qwen3-asr";
-const REQUIRED_FILES: [&str; 6] = [
-    "conv_frontend.onnx",
-    "encoder.int8.onnx",
-    "decoder.int8.onnx",
-    "tokenizer/vocab.json",
-    "tokenizer/merges.txt",
-    "tokenizer/tokenizer_config.json",
-];
-
-pub fn model_directory(package: &Path) -> PathBuf {
-    package.join(MODEL_DIRECTORY)
+pub fn model_directory(package: &Path, directory: &str) -> PathBuf {
+    package.join(directory)
 }
 
-pub fn is_ready(package: &Path) -> bool {
-    let model = model_directory(package);
-    REQUIRED_FILES.iter().all(|name| {
+pub fn is_ready(package: &Path, directory: &str, required_files: &[&str]) -> bool {
+    let model = model_directory(package, directory);
+    required_files.iter().all(|name| {
         model
             .join(name)
             .metadata()
@@ -31,8 +21,13 @@ pub fn is_ready(package: &Path) -> bool {
     })
 }
 
-pub fn prepare(package: &Path, archive_path: &Path) -> Result<(), ModelError> {
-    if is_ready(package) {
+pub fn prepare(
+    package: &Path,
+    archive_path: &Path,
+    directory: &str,
+    required_files: &[&str],
+) -> Result<(), ModelError> {
+    if is_ready(package, directory, required_files) {
         return Ok(());
     }
     let temporary = tempfile::Builder::new()
@@ -41,17 +36,17 @@ pub fn prepare(package: &Path, archive_path: &Path) -> Result<(), ModelError> {
     let extracted = temporary.path().join("contents");
     fs::create_dir(&extracted)?;
     extract_archive(archive_path, &extracted)?;
-    let source = find_model_root(&extracted, 0)
-        .ok_or_else(|| ModelError::MissingModelAsset("Qwen3-ASR ONNX model layout".to_owned()))?;
-    let destination = model_directory(package);
+    let source = find_model_root(&extracted, required_files, 0)
+        .ok_or_else(|| ModelError::MissingModelAsset(format!("{directory} ONNX model layout")))?;
+    let destination = model_directory(package, directory);
     if destination.exists() {
         fs::remove_dir_all(&destination)?;
     }
     fs::rename(source, &destination)?;
-    if !is_ready(package) {
-        return Err(ModelError::MissingModelAsset(
-            "Qwen3-ASR ONNX model layout".to_owned(),
-        ));
+    if !is_ready(package, directory, required_files) {
+        return Err(ModelError::MissingModelAsset(format!(
+            "{directory} ONNX model layout"
+        )));
     }
     Ok(())
 }
@@ -81,8 +76,8 @@ fn extract_archive(archive_path: &Path, destination: &Path) -> Result<(), ModelE
     Ok(())
 }
 
-fn find_model_root(directory: &Path, depth: usize) -> Option<PathBuf> {
-    if REQUIRED_FILES
+fn find_model_root(directory: &Path, required_files: &[&str], depth: usize) -> Option<PathBuf> {
+    if required_files
         .iter()
         .all(|name| directory.join(name).is_file())
     {
@@ -96,7 +91,7 @@ fn find_model_root(directory: &Path, depth: usize) -> Option<PathBuf> {
         .filter_map(Result::ok)
         .find_map(|entry| {
             entry.file_type().ok().filter(|kind| kind.is_dir())?;
-            find_model_root(&entry.path(), depth + 1)
+            find_model_root(&entry.path(), required_files, depth + 1)
         })
 }
 
@@ -105,14 +100,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recognizes_the_required_qwen_layout() {
+    fn recognizes_the_qwen_model_layout() {
         let root = tempfile::tempdir().unwrap();
-        let model = model_directory(root.path());
-        for name in REQUIRED_FILES {
+        let required_files = [
+            "conv_frontend.onnx",
+            "encoder.int8.onnx",
+            "decoder.int8.onnx",
+            "tokenizer/vocab.json",
+            "tokenizer/merges.txt",
+            "tokenizer/tokenizer_config.json",
+        ];
+        let model = model_directory(root.path(), "qwen3-asr");
+        for name in &required_files {
             let path = model.join(name);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, b"asset").unwrap();
         }
-        assert!(is_ready(root.path()));
+        assert!(is_ready(root.path(), "qwen3-asr", &required_files));
     }
 }

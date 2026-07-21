@@ -20,15 +20,6 @@ pub enum CaptureSource {
     System,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AudioDeviceDescriptor {
-    pub id: String,
-    pub is_default: bool,
-    pub name: String,
-    pub source: CaptureSource,
-}
-
 #[derive(Debug)]
 pub struct CapturedAudio {
     pub captured_at: Instant,
@@ -46,12 +37,6 @@ pub enum CaptureEvent {
         message: String,
         source: CaptureSource,
     },
-}
-
-#[derive(Debug, Clone)]
-pub struct CaptureRequest {
-    pub device_id: Option<String>,
-    pub source: CaptureSource,
 }
 
 pub struct CaptureSession {
@@ -78,93 +63,35 @@ impl CaptureSession {
     }
 }
 
-pub fn list_audio_devices() -> Result<Vec<AudioDeviceDescriptor>, CaptureError> {
-    let host = capture_host()?;
-    let mut descriptors = vec![
-        AudioDeviceDescriptor {
-            id: "default:microphone".to_owned(),
-            is_default: true,
-            name: "System default microphone".to_owned(),
-            source: CaptureSource::Microphone,
-        },
-        AudioDeviceDescriptor {
-            id: "default:system".to_owned(),
-            is_default: true,
-            name: "System default output".to_owned(),
-            source: CaptureSource::System,
-        },
-    ];
-    let devices = host
-        .devices()
-        .map_err(|error| CaptureError::Backend(error.to_string()))?;
-    for device in devices {
-        let id = device
-            .id()
-            .map_err(|error| CaptureError::Backend(error.to_string()))?
-            .id()
-            .to_owned();
-        let name = device
-            .description()
-            .map(|description| description.name().to_owned())
-            .unwrap_or_else(|_| device.to_string());
-        if device.supports_input() {
-            descriptors.push(AudioDeviceDescriptor {
-                id: id.clone(),
-                is_default: false,
-                name: name.clone(),
-                source: CaptureSource::Microphone,
-            });
-        }
-        #[cfg(not(target_os = "macos"))]
-        if device.supports_output() {
-            descriptors.push(AudioDeviceDescriptor {
-                id,
-                is_default: false,
-                name,
-                source: CaptureSource::System,
-            });
-        }
-    }
-    descriptors.sort_by(|left, right| {
-        right
-            .is_default
-            .cmp(&left.is_default)
-            .then(left.source.sort_key().cmp(&right.source.sort_key()))
-            .then(left.name.cmp(&right.name))
-    });
-    descriptors.dedup_by(|left, right| left.id == right.id && left.source == right.source);
-    Ok(descriptors)
-}
-
 pub fn start_capture(
-    request: CaptureRequest,
+    source: CaptureSource,
     sender: Sender<CaptureEvent>,
 ) -> Result<CaptureSession, CaptureError> {
     #[cfg(target_os = "macos")]
-    if request.source == CaptureSource::System {
+    if source == CaptureSource::System {
         return macos::start_system_audio(sender);
     }
-    start_cpal_capture(request, sender)
+    start_cpal_capture(source, sender)
 }
 
 fn start_cpal_capture(
-    request: CaptureRequest,
+    source: CaptureSource,
     sender: Sender<CaptureEvent>,
 ) -> Result<CaptureSession, CaptureError> {
     let host = capture_host()?;
-    let device = select_device(&host, &request)?;
+    let device = select_default_device(&host, source)?;
     let device_name = device
         .description()
         .map(|description| description.name().to_owned())
         .unwrap_or_else(|_| device.to_string());
-    let supported = match request.source {
+    let supported = match source {
         CaptureSource::Microphone => device.default_input_config(),
         CaptureSource::System => device.default_output_config(),
     }
     .map_err(|error| CaptureError::Backend(error.to_string()))?;
     let sample_rate = supported.sample_rate();
     let channels = supported.channels();
-    let stream = build_stream(device, supported, request.source, sender)?;
+    let stream = build_stream(device, supported, source, sender)?;
     stream
         .play()
         .map_err(|error| CaptureError::Backend(error.to_string()))?;
@@ -173,7 +100,7 @@ fn start_cpal_capture(
         channels,
         device_name,
         sample_rate,
-        source: request.source,
+        source,
     })
 }
 
@@ -187,33 +114,12 @@ pub enum CaptureError {
     UnsupportedSampleFormat(String),
 }
 
-impl CaptureSource {
-    fn sort_key(self) -> u8 {
-        match self {
-            Self::Microphone => 0,
-            Self::System => 1,
-        }
-    }
-}
-
 fn capture_host() -> Result<Host, CaptureError> {
     Ok(cpal::default_host())
 }
 
-fn select_device(host: &Host, request: &CaptureRequest) -> Result<Device, CaptureError> {
-    let explicit = request
-        .device_id
-        .as_deref()
-        .filter(|value| !value.starts_with("default:"));
-    if let Some(id) = explicit {
-        let parsed = id
-            .parse()
-            .map_err(|error: cpal::Error| CaptureError::Backend(error.to_string()))?;
-        return host
-            .device_by_id(&parsed)
-            .ok_or_else(|| CaptureError::DeviceUnavailable(id.to_owned()));
-    }
-    match request.source {
+fn select_default_device(host: &Host, source: CaptureSource) -> Result<Device, CaptureError> {
+    match source {
         CaptureSource::Microphone => host.default_input_device(),
         CaptureSource::System => host.default_output_device(),
     }
@@ -404,58 +310,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_sort_order_is_stable() {
-        assert!(CaptureSource::Microphone.sort_key() < CaptureSource::System.sort_key());
-    }
-
-    #[test]
-    fn default_devices_use_reserved_ids() {
-        for (source, id) in [
-            (CaptureSource::Microphone, "default:microphone"),
-            (CaptureSource::System, "default:system"),
-        ] {
-            let request = CaptureRequest {
-                device_id: Some(id.to_owned()),
-                source,
-            };
-            assert!(
-                request
-                    .device_id
-                    .as_deref()
-                    .unwrap()
-                    .starts_with("default:")
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires an audio host"]
-    fn enumerates_host_audio_devices() {
-        let devices = list_audio_devices().unwrap();
-        assert!(
-            devices
-                .iter()
-                .any(|device| device.source == CaptureSource::Microphone)
-        );
-        assert!(
-            devices
-                .iter()
-                .any(|device| device.source == CaptureSource::System)
-        );
-    }
-
-    #[test]
     #[ignore = "requires a system output device"]
     fn opens_default_system_loopback_stream() {
         let (sender, _receiver) = crossbeam_channel::unbounded();
-        let session = start_capture(
-            CaptureRequest {
-                device_id: None,
-                source: CaptureSource::System,
-            },
-            sender,
-        )
-        .unwrap();
+        let session = start_capture(CaptureSource::System, sender).unwrap();
         assert_eq!(session.source, CaptureSource::System);
         session.stop();
     }

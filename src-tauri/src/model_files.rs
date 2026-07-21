@@ -28,7 +28,9 @@ pub(super) fn partial_downloaded_bytes(directory: &Path, spec: &ModelPackageSpec
     spec.artifacts
         .iter()
         .map(|artifact| {
-            if artifact.kind == ArtifactKind::ModelArchive && model_package::is_ready(directory) {
+            if artifact.kind == ArtifactKind::ModelArchive
+                && model_package::is_ready(directory, spec.model_directory, &spec.required_files)
+            {
                 return artifact.size;
             }
             let final_path = directory.join(&artifact.file_name);
@@ -56,10 +58,7 @@ pub(super) fn partial_path(path: &Path) -> PathBuf {
 }
 
 pub(super) fn file_matches(path: &Path, artifact: &ArtifactSpec) -> Result<bool, ModelError> {
-    if !path
-        .metadata()
-        .is_ok_and(|item| item.is_file() && item.len() == artifact.size)
-    {
+    if !file_has_expected_size(path, artifact) {
         return Ok(false);
     }
     match verify_sha256(path, &artifact.sha256) {
@@ -67,6 +66,11 @@ pub(super) fn file_matches(path: &Path, artifact: &ArtifactSpec) -> Result<bool,
         Err(ModelError::ChecksumMismatch { .. }) => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+pub(super) fn file_has_expected_size(path: &Path, artifact: &ArtifactSpec) -> bool {
+    path.metadata()
+        .is_ok_and(|item| item.is_file() && item.len() == artifact.size)
 }
 
 pub(super) fn replace_with(final_path: &Path, replacement: &Path) -> Result<(), ModelError> {

@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::vad::VadConfig;
+use crate::{
+    models::{DEFAULT_MODEL_ID, is_supported_model},
+    vad::VadConfig,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,12 +73,10 @@ impl Default for DesktopSettings {
 #[serde(rename_all = "camelCase")]
 pub struct AudioSettings {
     pub format: AudioFormat,
-    pub microphone_device_id: Option<String>,
     pub microphone_gain: f32,
     pub output_directory: Option<PathBuf>,
     pub segment_minutes: u32,
     pub source: AudioSourceMode,
-    pub system_device_id: Option<String>,
     pub system_gain: f32,
 }
 
@@ -83,12 +84,10 @@ impl Default for AudioSettings {
     fn default() -> Self {
         Self {
             format: AudioFormat::Flac,
-            microphone_device_id: None,
             microphone_gain: 1.0,
             output_directory: None,
             segment_minutes: 60,
             source: AudioSourceMode::Mixed,
-            system_device_id: None,
             system_gain: 1.0,
         }
     }
@@ -108,7 +107,7 @@ impl Default for TranscriptionSettings {
     fn default() -> Self {
         Self {
             language: "auto".to_owned(),
-            model_id: "qwen3-asr-0.6b-int8".to_owned(),
+            model_id: DEFAULT_MODEL_ID.to_owned(),
             threads: default_transcription_threads(),
             unload_after_idle_minutes: 10,
             vad: VadConfig::default(),
@@ -150,9 +149,9 @@ impl AppSettings {
                 "transcription threads must be between 1 and 16".to_owned(),
             ));
         }
-        if self.transcription.model_id.trim().is_empty() {
+        if !is_supported_model(&self.transcription.model_id) {
             return Err(SettingsError::Validation(
-                "transcription modelId cannot be empty".to_owned(),
+                "transcription modelId is not supported".to_owned(),
             ));
         }
         self.transcription
@@ -182,7 +181,11 @@ pub struct SettingsStore {
 
 impl SettingsStore {
     pub fn open(path: PathBuf) -> Result<Self, SettingsError> {
-        let current = load_settings(&path)?;
+        let mut current = load_settings(&path)?;
+        if !is_supported_model(&current.transcription.model_id) {
+            current.transcription.model_id = DEFAULT_MODEL_ID.to_owned();
+            save_settings_atomic(&path, &current)?;
+        }
         current.validate()?;
         Ok(Self {
             current: RwLock::new(current),
@@ -282,5 +285,21 @@ mod tests {
 
         assert_eq!(settings.transcription.vad, VadConfig::default());
         settings.validate().unwrap();
+    }
+
+    #[test]
+    fn replaces_the_removed_parakeet_model_in_existing_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut settings = AppSettings::default();
+        settings.transcription.model_id = "parakeet-tdt-ctc-0.6b-ja-int8".to_owned();
+        save_settings_atomic(&path, &settings).unwrap();
+
+        let store = SettingsStore::open(path).unwrap();
+
+        assert_eq!(
+            store.snapshot().transcription.model_id,
+            TranscriptionSettings::default().model_id
+        );
     }
 }

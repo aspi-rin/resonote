@@ -10,8 +10,9 @@ import {
   DEFAULT_SETTINGS,
   DEFAULT_TRANSCRIPTION_STATUS,
   type AppSettings,
-  type AudioDevice,
+  type AudioSourceMode,
   type HistoryEntry,
+  type ModelCatalogEntry,
   type ModelDownloadStatus,
   type RecordingStatus,
   type TranscriptDocument,
@@ -25,6 +26,7 @@ type Tab = "record" | "history" | "settings";
 type IconName =
   | "archive"
   | "check"
+  | "download"
   | "folder"
   | "gear"
   | "history"
@@ -41,11 +43,16 @@ interface LiveTranscript {
 }
 
 const isTauri = "__TAURI_INTERNALS__" in window;
+const FALLBACK_MODEL_CATALOG: ModelCatalogEntry[] = [
+  { displayName: "Qwen3-ASR 0.6B INT8 · Multilingual", id: "qwen3-asr-0.6b-int8", totalBytes: 879_346_277 },
+  { displayName: "Qwen3-ASR 1.7B INT8 · High accuracy", id: "qwen3-asr-1.7b-int8", totalBytes: 2_404_866_275 },
+];
 
 function Icon({ name }: { name: IconName }) {
   const paths: Record<IconName, preact.JSX.Element> = {
     archive: <><path d="M4 7h16v13H4z"/><path d="M3 3h18v4H3zm6 8h6"/></>,
     check: <path d="m5 12 4 4L19 6"/>,
+    download: <><path d="M12 3v12m-5-5 5 5 5-5"/><path d="M5 20h14"/></>,
     folder: <path d="M3 6h7l2 2h9v11H3z"/>,
     gear: <><circle cx="12" cy="12" r="3"/><path d="M19 13.5v-3l-2-.7-.7-1.7.9-1.9-2.1-2.1-1.9.9-1.7-.7L10.5 2h-3l-.7 2-1.7.7-1.9-.9-2.1 2.1.9 1.9-.7 1.7-2 .7v3l2 .7.7 1.7-.9 1.9 2.1 2.1 1.9-.9 1.7.7.7 2h3l.7-2 1.7-.7 1.9.9 2.1-2.1-.9-1.9.7-1.7z"/></>,
     history: <><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5m4-2v6l4 2"/></>,
@@ -62,16 +69,19 @@ function Icon({ name }: { name: IconName }) {
 function App() {
   const [tab, setTab] = useState<Tab>("record");
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
-  const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [recording, setRecording] = useState<RecordingStatus>(DEFAULT_RECORDING_STATUS);
+  const [models, setModels] = useState<ModelCatalogEntry[]>(FALLBACK_MODEL_CATALOG);
   const [model, setModel] = useState<ModelDownloadStatus>(DEFAULT_MODEL_STATUS);
   const [transcription, setTranscription] = useState<TranscriptionStatus>(DEFAULT_TRANSCRIPTION_STATUS);
   const [liveTranscript, setLiveTranscript] = useState<LiveTranscript>({ segments: [], sessionId: null });
   const liveTranscriptSession = useRef<string | null>(null);
+  const selectedModelId = useRef(DEFAULT_SETTINGS.transcription.modelId);
+  const modelSelectionVersion = useRef(0);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [version, setVersion] = useState("0.1.0");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [modelTransitioning, setModelTransitioning] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const t = useMemo(() => translator(settings.desktop.language), [settings.desktop.language]);
@@ -90,18 +100,19 @@ function App() {
       return;
     }
     try {
-      const [loadedSettings, loadedDevices, loadedRecording, loadedModel, loadedTranscription, loadedHistory, info] =
+      const loadedSettings = await invoke<AppSettings>("get_settings");
+      selectedModelId.current = loadedSettings.transcription.modelId;
+      const [loadedRecording, loadedModels, loadedModel, loadedTranscription, loadedHistory, info] =
         await Promise.all([
-          invoke<AppSettings>("get_settings"),
-          invoke<AudioDevice[]>("list_audio_devices"),
           invoke<RecordingStatus>("get_recording_status"),
-          invoke<ModelDownloadStatus>("get_model_status", { modelId: DEFAULT_SETTINGS.transcription.modelId }),
+          invoke<ModelCatalogEntry[]>("list_transcription_models"),
+          invoke<ModelDownloadStatus>("get_model_status", { modelId: loadedSettings.transcription.modelId }),
           invoke<TranscriptionStatus>("get_transcription_status"),
           invoke<HistoryEntry[]>("list_recording_history", { limit: 100 }),
           invoke<{ version: string }>("app_info"),
         ]);
       setSettings(loadedSettings);
-      setDevices(loadedDevices);
+      setModels(loadedModels);
       liveTranscriptSession.current = loadedRecording.sessionId;
       setRecording(loadedRecording);
       setModel(loadedModel);
@@ -129,7 +140,9 @@ function App() {
         setRecording(event.payload);
         if (event.payload.phase === "idle") void refreshHistory();
       }),
-      listen<ModelDownloadStatus>("model-download-status", (event) => setModel(event.payload)),
+      listen<ModelDownloadStatus>("model-download-status", (event) => {
+        if (event.payload.modelId === selectedModelId.current) setModel(event.payload);
+      }),
       listen<TranscriptionStatus>("transcription-status", (event) => setTranscription(event.payload)),
       listen<TranscriptSegmentUpdate>("transcript-segment", (event) => {
         setLiveTranscript((current) => {
@@ -237,15 +250,86 @@ function App() {
     }
   };
 
+  const changeAudioSource = async (source: AudioSourceMode) => {
+    const isRecording = recording.phase === "recording";
+    const currentSource = isRecording ? recording.audioSource : settings.audio.source;
+    if (source === currentSource) return;
+    const nextSettings = {
+      ...settings,
+      audio: { ...settings.audio, source },
+    };
+    setBusy(true);
+    setError(null);
+    try {
+      if (isTauri && isRecording) {
+        setRecording(await invoke<RecordingStatus>("set_recording_source", { source }));
+      } else if (!isTauri && isRecording) {
+        setRecording((current) => ({ ...current, audioSource: source }));
+      }
+      setSettings(nextSettings);
+      if (isTauri) {
+        setSettings(await invoke<AppSettings>("save_settings", { settings: nextSettings }));
+      }
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const installModel = () => {
     if (!isTauri) {
       setModel({ ...model, phase: "downloaded", downloadedBytes: 1, totalBytes: 1 });
       return;
     }
     setError(null);
-    void invoke<ModelDownloadStatus>("install_model", { modelId: settings.transcription.modelId })
-      .then(setModel)
-      .catch((reason) => setError(String(reason)));
+    const modelId = settings.transcription.modelId;
+    void invoke<ModelDownloadStatus>("install_model", { modelId })
+      .then((status) => {
+        if (status.modelId === selectedModelId.current) setModel(status);
+      })
+      .catch((reason) => {
+        if (modelId === selectedModelId.current) setError(String(reason));
+      });
+  };
+
+  const selectModel = async (modelId: string) => {
+    const selectionVersion = ++modelSelectionVersion.current;
+    const cancelCurrentDownload = model.phase === "downloading" && model.modelId !== modelId;
+    const selected = models.find((item) => item.id === modelId);
+    selectedModelId.current = modelId;
+    update((next) => { next.transcription.modelId = modelId; });
+    setModel({
+      ...DEFAULT_MODEL_STATUS,
+      modelId,
+      totalBytes: selected?.totalBytes ?? 0,
+    });
+    if (!isTauri) {
+      return;
+    }
+    setError(null);
+    setModelTransitioning(true);
+    try {
+      if (cancelCurrentDownload) await invoke("cancel_model_install");
+      const status = await invoke<ModelDownloadStatus>("get_model_status", { modelId });
+      if (status.modelId === selectedModelId.current) setModel(status);
+    } catch (reason) {
+      if (modelId === selectedModelId.current) setError(String(reason));
+    } finally {
+      if (selectionVersion === modelSelectionVersion.current) setModelTransitioning(false);
+    }
+  };
+
+  const cancelModel = async () => {
+    setError(null);
+    setModelTransitioning(true);
+    try {
+      await invoke("cancel_model_install");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setModelTransitioning(false);
+    }
   };
 
   const chooseOutputDirectory = async () => {
@@ -305,9 +389,9 @@ function App() {
 
         {error && <div class="error-banner" role="alert"><strong>{t("error")}</strong><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
 
-        {tab === "record" && <RecordView t={t} settings={settings} recording={recording} transcription={transcription} model={model} liveSegments={liveTranscript.segments} busy={busy} isActive={isActive} update={update} start={startRecording} stop={stopRecording} installModel={installModel} cancelModel={() => void invoke("cancel_model_install")} />}
+        {tab === "record" && <RecordView t={t} settings={settings} recording={recording} transcription={transcription} model={model} liveSegments={liveTranscript.segments} busy={busy} isActive={isActive} changeSource={changeAudioSource} start={startRecording} stop={stopRecording} />}
         {tab === "history" && <HistoryView t={t} locale={locale} history={history} refresh={() => void refreshHistory()} open={(sessionId) => void invoke("open_recording_directory", { sessionId }).catch((reason) => setError(String(reason)))} remove={(sessionId) => void deleteRecording(sessionId)} />}
-        {tab === "settings" && <SettingsView t={t} settings={settings} devices={devices} busy={busy || isActive} saved={saved} update={update} save={() => void saveSettings()} model={model} installModel={installModel} chooseOutputDirectory={() => void chooseOutputDirectory()} />}
+        {tab === "settings" && <SettingsView t={t} settings={settings} models={models} busy={busy || isActive} modelTransitioning={modelTransitioning} saved={saved} update={update} save={() => void saveSettings()} model={model} selectModel={(modelId) => void selectModel(modelId)} installModel={installModel} cancelModel={() => void cancelModel()} chooseOutputDirectory={() => void chooseOutputDirectory()} />}
       </main>
     </div>
   );
@@ -319,11 +403,12 @@ function NavButton({ active, icon, label, onClick }: { active: boolean; icon: Ic
 
 interface ViewProps { t: ReturnType<typeof translator> }
 
-function RecordView({ t, settings, recording, transcription, model, liveSegments, busy, isActive, update, start, stop, installModel, cancelModel }: ViewProps & {
+function RecordView({ t, settings, recording, transcription, model, liveSegments, busy, isActive, changeSource, start, stop }: ViewProps & {
   settings: AppSettings; recording: RecordingStatus; transcription: TranscriptionStatus; model: ModelDownloadStatus; liveSegments: TranscriptSegment[]; busy: boolean; isActive: boolean;
-  update: (mutate: (next: AppSettings) => void) => void; start: () => void; stop: () => void; installModel: () => void; cancelModel: () => void;
+  changeSource: (source: AudioSourceMode) => void; start: () => void; stop: () => void;
 }) {
-  const progress = model.totalBytes > 0 ? Math.min(100, model.downloadedBytes / model.totalBytes * 100) : 0;
+  const currentSource = recording.phase === "recording" ? recording.audioSource : settings.audio.source;
+  const sourceSwitchingDisabled = busy || recording.phase === "starting" || recording.phase === "stopping";
   return <div class="view-stack">
     <section class={`record-card ${isActive ? "active" : ""}`}>
       <div class="record-summary"><span class="record-label">{isActive ? t("recording") : t("ready")}</span><strong class="timer">{formatDuration(recording.elapsedMs)}</strong><span class="session-meta">{recording.segmentCount} {t("segments").toLowerCase()}</span></div>
@@ -331,22 +416,18 @@ function RecordView({ t, settings, recording, transcription, model, liveSegments
       <button class={`record-button ${isActive ? "stop" : ""}`} disabled={busy} onClick={isActive ? stop : start}><span class="record-button-icon" />{isActive ? t("stop") : t("start")}</button>
     </section>
 
-    <LiveTranscriptPanel t={t} segments={liveSegments} />
+    <LiveTranscriptPanel t={t} segments={liveSegments} transcription={transcription} model={model} />
 
     <section class="quick-grid">
-      <label class="field"><span>{t("source")}</span><select disabled={isActive} value={settings.audio.source} onChange={(event) => update((next) => { next.audio.source = event.currentTarget.value as AppSettings["audio"]["source"]; })}><option value="mixed">{t("mixed")}</option><option value="microphone">{t("microphone")}</option><option value="system">{t("system")}</option></select></label>
+      <label class="field"><span>{t("source")}</span><select disabled={sourceSwitchingDisabled} value={currentSource} onChange={(event) => changeSource(event.currentTarget.value as AudioSourceMode)}><option value="mixed">{t("mixed")}</option><option value="microphone">{t("microphone")}</option><option value="system">{t("system")}</option></select></label>
     </section>
 
     <section class="panel-card">
       <div class="section-heading"><div><span class="section-icon"><Icon name="wave" /></span><div><h2>{t("liveSignal")}</h2><p>{t("voiceActivity")}: {Math.round(recording.vadProbability * 100)}%</p></div></div></div>
-      <Level label={t("microphone")} value={recording.microphoneDb} muted={settings.audio.source === "system"} />
-      <Level label={t("system")} value={recording.systemDb} muted={settings.audio.source === "microphone"} />
+      <Level label={t("microphone")} value={recording.microphoneDb} muted={currentSource === "system"} />
+      <Level label={t("system")} value={recording.systemDb} muted={currentSource === "microphone"} />
     </section>
 
-    <section class="panel-card model-card">
-      <div class="section-heading"><div><span class="section-icon"><Icon name="archive" /></span><div><h2>{t("transcription")}</h2><p>{transcriptionLabel(t, transcription, model)}</p></div></div><span class={`model-dot ${model.phase}`} /></div>
-      {model.phase === "downloading" ? <><div class="progress-track"><i style={{ width: `${progress}%` }} /></div><div class="progress-meta"><span>{model.currentFile ?? t("modelFile")}</span><span>{formatBytes(model.downloadedBytes)} / {formatBytes(model.totalBytes)}</span></div><button class="secondary-button" onClick={cancelModel}>{t("cancel")}</button></> : model.phase !== "downloaded" ? <button class="secondary-button accent" onClick={installModel}>{t("downloadModel")}</button> : <div class="model-ready"><Icon name="check" /><span>{t("modelReady")}</span>{transcription.pendingSegments > 0 && <em>{transcription.pendingSegments} {t("pendingSegments").toLowerCase()}</em>}</div>}
-    </section>
   </div>;
 }
 
@@ -354,7 +435,7 @@ const TRANSCRIPT_MIN_HEIGHT = 120;
 const TRANSCRIPT_MAX_HEIGHT = 520;
 const TRANSCRIPT_HEIGHT_STEP = 24;
 
-function LiveTranscriptPanel({ t, segments }: ViewProps & { segments: TranscriptSegment[] }) {
+function LiveTranscriptPanel({ t, segments, transcription, model }: ViewProps & { segments: TranscriptSegment[]; transcription: TranscriptionStatus; model: ModelDownloadStatus }) {
   const [height, setHeight] = useState(220);
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedToBottom = useRef(true);
@@ -401,7 +482,7 @@ function LiveTranscriptPanel({ t, segments }: ViewProps & { segments: Transcript
   };
 
   return <section class="panel-card transcript-panel">
-    <div class="section-heading"><div><span class="section-icon"><Icon name="text" /></span><div><h2>{t("liveTranscript")}</h2><p>{t("liveTranscriptHint")}</p></div></div>{segments.length > 0 && <span class="transcript-count">{segments.length}</span>}</div>
+    <div class="section-heading"><div><span class="section-icon"><Icon name="text" /></span><div><h2>{t("liveTranscript")}</h2><p>{t("liveTranscriptHint")}</p></div></div><div class="transcript-heading-status"><TranscriptionBadge t={t} status={transcription} model={model} />{segments.length > 0 && <span class="transcript-count">{segments.length}</span>}</div></div>
     <div class="transcript-scroll" style={{ height: `${height}px` }} ref={scrollRef} onScroll={trackScroll} aria-live="polite" aria-relevant="additions text">
       {segments.length === 0
         ? <p class="transcript-empty">{t("liveTranscriptEmpty")}</p>
@@ -411,24 +492,50 @@ function LiveTranscriptPanel({ t, segments }: ViewProps & { segments: Transcript
   </section>;
 }
 
+function TranscriptionBadge({ t, status, model }: ViewProps & { status: TranscriptionStatus; model: ModelDownloadStatus }) {
+  if (model.phase !== "downloaded") {
+    const label = model.phase === "downloading" ? t("modelDownloading") : t("modelMissing");
+    return <span class={`transcription-badge model-${model.phase}`} title={model.error ?? label} aria-live="polite"><i />{label}</span>;
+  }
+  if (status.phase === "idle" && status.pendingSegments === 0) return null;
+  const label = status.phase === "waitingForModel"
+    ? t("waitingModel")
+    : status.phase === "loadingModel"
+      ? t("modelLoading")
+      : status.phase === "transcribing"
+        ? t("transcribing")
+        : status.phase === "failed"
+          ? t("transcriptionFailed")
+          : t("pendingSegments");
+  const pending = status.pendingSegments > 0 ? ` · ${status.pendingSegments}` : "";
+  return <span class={`transcription-badge ${status.phase}`} title={status.error ?? label} aria-live="polite"><i />{label}{pending}</span>;
+}
+
 function HistoryView({ t, locale, history, refresh, open, remove }: ViewProps & { locale: string; history: HistoryEntry[]; refresh: () => void; open: (id: string) => void; remove: (id: string) => void }) {
   return <div class="view-stack"><div class="view-actions"><p>{history.length} {t("history").toLowerCase()}</p><button class="icon-button" onClick={refresh}><Icon name="refresh" />{t("refresh")}</button></div>
     {history.length === 0 ? <section class="empty-state"><span><Icon name="history" /></span><h2>{t("noHistory")}</h2><p>{t("noHistoryHint")}</p></section> : <div class="history-list">{history.map((entry) => <article class="history-card" key={entry.sessionId}><div class="history-date"><strong>{new Date(entry.startedAt).toLocaleDateString(locale, { month: "short", day: "numeric" })}</strong><span>{new Date(entry.startedAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" })}</span></div><div class="history-body"><div class="history-title"><strong>{sourceLabel(t, entry.audioSource)}</strong><span>{formatDuration(entry.durationMs)} · {entry.audioFormat.toUpperCase()}</span></div><p>{entry.transcriptPreview || t("noTranscript")}</p><div class="history-tags"><span>{t(entry.status === "recording" ? "recording" : entry.status === "interrupted" ? "interrupted" : entry.status === "failed" ? "failed" : "completed")}</span>{entry.transcriptStatus && <span>{t(entry.transcriptStatus === "complete" ? "transcriptComplete" : entry.transcriptStatus === "partial" ? "transcriptPartial" : "transcriptPending")}</span>}</div></div><div class="history-actions"><button class="folder-button" title={t("openFolder")} onClick={() => open(entry.sessionId)}><Icon name="folder" /></button><button class="folder-button delete-button" disabled={entry.status === "recording"} title={t("deleteRecording")} onClick={() => remove(entry.sessionId)}><Icon name="trash" /></button></div></article>)}</div>}
   </div>;
 }
 
-function SettingsView({ t, settings, devices, busy, saved, update, save, model, installModel, chooseOutputDirectory }: ViewProps & { settings: AppSettings; devices: AudioDevice[]; busy: boolean; saved: boolean; update: (mutate: (next: AppSettings) => void) => void; save: () => void; model: ModelDownloadStatus; installModel: () => void; chooseOutputDirectory: () => void }) {
-  const microphones = devices.filter((device) => device.source === "microphone" && !device.isDefault);
-  const systems = devices.filter((device) => device.source === "system" && !device.isDefault);
+function SettingsView({ t, settings, models, busy, modelTransitioning, saved, update, save, model, selectModel, installModel, cancelModel, chooseOutputDirectory }: ViewProps & { settings: AppSettings; models: ModelCatalogEntry[]; busy: boolean; modelTransitioning: boolean; saved: boolean; update: (mutate: (next: AppSettings) => void) => void; save: () => void; model: ModelDownloadStatus; selectModel: (modelId: string) => void; installModel: () => void; cancelModel: () => void; chooseOutputDirectory: () => void }) {
   return <div class="settings-stack">
     <SettingsSection icon="mic" title={t("audio")}>
-      <div class="form-grid"><SelectField label={t("microphoneDevice")} value={settings.audio.microphoneDeviceId ?? ""} onChange={(value) => update((next) => { next.audio.microphoneDeviceId = value || null; })} options={[{ value: "", label: t("defaultDevice") }, ...microphones.map((device) => ({ value: device.id, label: device.name }))]} /><SelectField label={t("systemDevice")} value={settings.audio.systemDeviceId ?? ""} onChange={(value) => update((next) => { next.audio.systemDeviceId = value || null; })} options={[{ value: "", label: t("defaultDevice") }, ...systems.map((device) => ({ value: device.id, label: device.name }))]} />
-      <RangeField label={t("microphoneGain")} value={settings.audio.microphoneGain} min={0} max={4} step={0.1} suffix="×" onChange={(value) => update((next) => { next.audio.microphoneGain = value; })} /><RangeField label={t("systemGain")} value={settings.audio.systemGain} min={0} max={4} step={0.1} suffix="×" onChange={(value) => update((next) => { next.audio.systemGain = value; })} />
+      <div class="form-grid"><RangeField label={t("microphoneGain")} value={settings.audio.microphoneGain} min={0} max={4} step={0.1} suffix="×" onChange={(value) => update((next) => { next.audio.microphoneGain = value; })} /><RangeField label={t("systemGain")} value={settings.audio.systemGain} min={0} max={4} step={0.1} suffix="×" onChange={(value) => update((next) => { next.audio.systemGain = value; })} />
       <SelectField label={t("format")} value={settings.audio.format} onChange={(value) => update((next) => { next.audio.format = value as AppSettings["audio"]["format"]; })} options={[{ value: "flac", label: "FLAC" }, { value: "wav", label: "WAV" }]} /><NumberField label={t("segmentMinutes")} value={settings.audio.segmentMinutes} min={1} max={1440} onChange={(value) => update((next) => { next.audio.segmentMinutes = value; })} /></div>
       <div class="path-field"><span>{t("output")}</span><div class="path-row"><code>{settings.audio.outputDirectory ?? t("appDefault")}</code><button class="icon-button" type="button" onClick={chooseOutputDirectory}><Icon name="folder" />{t("chooseFolder")}</button>{settings.audio.outputDirectory && <button class="icon-button" type="button" onClick={() => update((next) => { next.audio.outputDirectory = null; })}>{t("useDefault")}</button>}</div></div>
     </SettingsSection>
 
-    <SettingsSection icon="archive" title={t("asr")}><div class="form-grid"><SelectField label={t("recognitionLanguage")} value={settings.transcription.language} onChange={(value) => update((next) => { next.transcription.language = value; })} options={[{ value: "auto", label: t("automatic") }, { value: "zh-CN", label: t("chinese") }, { value: "en-US", label: t("english") }, { value: "Japanese", label: t("japanese") }]} /><NumberField label={t("threads")} value={settings.transcription.threads} min={1} max={16} onChange={(value) => update((next) => { next.transcription.threads = value; })} /><NumberField label={t("idleUnload")} value={settings.transcription.unloadAfterIdleMinutes} min={0} max={1440} onChange={(value) => update((next) => { next.transcription.unloadAfterIdleMinutes = value; })} /><RangeField label={t("vadThreshold")} value={settings.transcription.vad.activationThreshold} min={0.1} max={0.95} step={0.05} suffix="" onChange={(value) => update((next) => { next.transcription.vad.activationThreshold = value; })} /></div>{model.phase !== "downloaded" && <button class="secondary-button accent" onClick={installModel}>{t("downloadModel")}</button>}</SettingsSection>
+    <SettingsSection icon="archive" title={t("asr")} action={<ModelActionButton t={t} model={model} busy={modelTransitioning} install={installModel} cancel={cancelModel} />}>
+      <div class="model-picker">
+        <SelectField label={t("transcriptionModel")} value={settings.transcription.modelId} onChange={selectModel} options={models.map((item) => ({ value: item.id, label: item.displayName }))} />
+      </div>
+      <div class="form-grid">
+        <SelectField label={t("recognitionLanguage")} value={settings.transcription.language} onChange={(value) => update((next) => { next.transcription.language = value; })} options={[{ value: "auto", label: t("automatic") }, { value: "zh-CN", label: t("chinese") }, { value: "en-US", label: t("english") }, { value: "Japanese", label: t("japanese") }]} />
+        <NumberField label={t("threads")} value={settings.transcription.threads} min={1} max={16} onChange={(value) => update((next) => { next.transcription.threads = value; })} />
+        <NumberField label={t("idleUnload")} value={settings.transcription.unloadAfterIdleMinutes} min={0} max={1440} onChange={(value) => update((next) => { next.transcription.unloadAfterIdleMinutes = value; })} />
+        <RangeField label={t("vadThreshold")} value={settings.transcription.vad.activationThreshold} min={0.1} max={0.95} step={0.05} suffix="" onChange={(value) => update((next) => { next.transcription.vad.activationThreshold = value; })} />
+      </div>
+    </SettingsSection>
 
     <SettingsSection icon="gear" title={t("desktop")}><Toggle label={t("hideOnClose")} checked={settings.desktop.hideWindowOnClose} onChange={(checked) => update((next) => { next.desktop.hideWindowOnClose = checked; })} /><Toggle label={t("launchAtLogin")} checked={settings.desktop.launchAtLogin} onChange={(checked) => update((next) => { next.desktop.launchAtLogin = checked; })} /><Toggle label={t("recordOnLaunch")} checked={settings.desktop.startRecordingOnLaunch} onChange={(checked) => update((next) => { next.desktop.startRecordingOnLaunch = checked; })} /></SettingsSection>
 
@@ -437,8 +544,32 @@ function SettingsView({ t, settings, devices, busy, saved, update, save, model, 
   </div>;
 }
 
-function SettingsSection({ icon, title, children }: { icon: IconName; title: string; children: preact.ComponentChildren }) { return <section class="panel-card settings-section"><div class="section-heading"><div><span class="section-icon"><Icon name={icon} /></span><h2>{title}</h2></div></div>{children}</section>; }
-function SelectField({ label, value, options, onChange }: { label: string; value: string; options: { value: string; label: string }[]; onChange: (value: string) => void }) { return <label class="field"><span>{label}</span><select value={value} onChange={(event) => onChange(event.currentTarget.value)}>{options.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>; }
+function SettingsSection({ icon, title, action, children }: { icon: IconName; title: string; action?: preact.ComponentChildren; children: preact.ComponentChildren }) { return <section class="panel-card settings-section"><div class={`section-heading ${action ? "has-action" : ""}`}><div><span class="section-icon"><Icon name={icon} /></span><h2>{title}</h2></div>{action}</div>{children}</section>; }
+function ModelActionButton({ t, model, busy, install, cancel }: ViewProps & { model: ModelDownloadStatus; busy: boolean; install: () => void; cancel: () => void }) {
+  const progress = model.totalBytes > 0 ? Math.min(100, model.downloadedBytes / model.totalBytes * 100) : 0;
+  const downloaded = model.phase === "downloaded";
+  const downloading = model.phase === "downloading";
+  const label = downloaded
+    ? t("modelReady")
+    : downloading
+      ? `${t("modelDownloading")} · ${Math.round(progress)}% · ${t("cancel")}`
+      : `${t("downloadModel")} · ${formatBytes(model.totalBytes)}`;
+  const title = downloading
+    ? `${model.currentFile ?? t("modelFile")} · ${formatBytes(model.downloadedBytes)} / ${formatBytes(model.totalBytes)}`
+    : label;
+  return <button type="button" class={`model-action-button ${model.phase}`} disabled={downloaded || busy} onClick={downloading ? cancel : install} title={title} aria-live="polite">
+    {downloading && <i class="model-action-progress" style={{ width: `${progress}%` }} />}
+    <span class="model-action-content">
+      <span class="model-action-icon" aria-hidden="true">
+        <span class={`model-action-icon-state ${downloaded ? "" : "active"}`}><Icon name="download" /></span>
+        <span class={`model-action-icon-state ready ${downloaded ? "active" : ""}`}><Icon name="check" /></span>
+      </span>
+      <span>{label}</span>
+    </span>
+  </button>;
+}
+
+function SelectField({ label, value, options, disabled = false, onChange }: { label: string; value: string; options: { value: string; label: string }[]; disabled?: boolean; onChange: (value: string) => void }) { return <label class="field"><span>{label}</span><select value={value} disabled={disabled} onChange={(event) => onChange(event.currentTarget.value)}>{options.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>; }
 function NumberField({ label, value, min, max, onChange }: { label: string; value: number; min: number; max: number; onChange: (value: number) => void }) { return <label class="field"><span>{label}</span><input type="number" value={value} min={min} max={max} onChange={(event) => onChange(Number(event.currentTarget.value))} /></label>; }
 function RangeField({ label, value, min, max, step, suffix, onChange }: { label: string; value: number; min: number; max: number; step: number; suffix: string; onChange: (value: number) => void }) { return <label class="range-field"><span><b>{label}</b><em>{value.toFixed(step < 0.1 ? 2 : 1)}{suffix}</em></span><input type="range" value={value} min={min} max={max} step={step} onInput={(event) => onChange(Number(event.currentTarget.value))} /></label>; }
 function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) { return <label class="toggle-row"><span>{label}</span><input type="checkbox" checked={checked} onChange={(event) => onChange(event.currentTarget.checked)} /><i /></label>; }
@@ -470,7 +601,6 @@ function mergeSegments(fetched: TranscriptSegment[], received: TranscriptSegment
   const base = [...fetched].sort((a, b) => a.id - b.id);
   return received.reduce(upsertSegment, base);
 }
-function transcriptionLabel(t: ReturnType<typeof translator>, transcription: TranscriptionStatus, model: ModelDownloadStatus) { if (model.phase === "missing" || model.phase === "failed" || model.phase === "cancelled") return t("modelMissing"); if (model.phase === "downloading") return t("modelDownloading"); if (transcription.phase === "loadingModel") return t("modelLoading"); if (transcription.phase === "transcribing") return t("transcribing"); if (transcription.phase === "waitingForModel") return t("waitingModel"); return t("modelReady"); }
 function formatDuration(milliseconds: number) { const total = Math.floor(milliseconds / 1000); const hours = Math.floor(total / 3600); const minutes = Math.floor(total % 3600 / 60); const seconds = total % 60; return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`; }
 function formatBytes(bytes: number) { if (bytes <= 0) return "0 B"; const units = ["B", "KB", "MB", "GB"]; const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024))); return `${(bytes / 1024 ** index).toFixed(index > 1 ? 1 : 0)} ${units[index]}`; }
 

@@ -1,11 +1,48 @@
 use std::{
     io::{BufRead, BufReader, Write},
     net::TcpListener,
+    sync::{Arc, mpsc},
     thread,
+    time::Duration,
 };
 
 use super::*;
 use sha2::{Digest, Sha256};
+
+#[test]
+fn cancelling_and_waiting_does_not_return_until_the_install_task_exits() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = Arc::new(ModelManager::new(directory.path().to_path_buf()).unwrap());
+    let (install_locked_tx, install_locked_rx) = mpsc::channel();
+    let (release_install_tx, release_install_rx) = mpsc::channel();
+    let installer_manager = Arc::clone(&manager);
+    let installer = thread::spawn(move || {
+        let _guard = installer_manager.install_lock.lock().unwrap();
+        install_locked_tx.send(()).unwrap();
+        release_install_rx.recv().unwrap();
+    });
+    install_locked_rx.recv().unwrap();
+
+    let (cancelled_tx, cancelled_rx) = mpsc::channel();
+    let cancelling_manager = Arc::clone(&manager);
+    let canceller = thread::spawn(move || {
+        cancelling_manager.cancel_install_and_wait();
+        cancelled_tx.send(()).unwrap();
+    });
+
+    while !manager.cancel.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    assert!(matches!(
+        cancelled_rx.recv_timeout(Duration::from_millis(20)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    release_install_tx.send(()).unwrap();
+    cancelled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    installer.join().unwrap();
+    canceller.join().unwrap();
+}
 
 #[test]
 fn resumes_and_verifies_an_interrupted_download() {
@@ -103,20 +140,48 @@ fn restarts_a_complete_partial_file_with_the_wrong_checksum() {
 }
 
 #[test]
-fn catalog_uses_pinned_sherpa_assets() {
-    let spec = model_spec(CATALOG_MODEL_ID).unwrap();
-    assert_eq!(spec.revision, CATALOG_REVISION);
-    assert_eq!(spec.artifacts.len(), 2);
-    assert!(spec.artifacts.iter().all(|item| item.sha256.len() == 64));
-    assert!(
-        spec.artifacts
+fn catalog_uses_pinned_assets_for_every_model() {
+    let catalog = model_catalog();
+    assert_eq!(
+        catalog
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        [DEFAULT_MODEL_ID, "qwen3-asr-1.7b-int8"]
+    );
+    for entry in catalog {
+        let spec = model_spec(&entry.id).unwrap();
+        assert_eq!(
+            entry.total_bytes,
+            spec.artifacts.iter().map(|item| item.size).sum::<u64>()
+        );
+        assert!(spec.artifacts.iter().all(|item| item.sha256.len() == 64));
+        assert!(
+            spec.artifacts
+                .iter()
+                .any(|item| item.kind == ArtifactKind::VadModel)
+        );
+        assert!(!spec.required_files.is_empty());
+        if !spec
+            .artifacts
             .iter()
             .any(|item| item.kind == ArtifactKind::ModelArchive)
-    );
+        {
+            for required in &spec.required_files {
+                let expected = format!("{}/{}", spec.model_directory, required);
+                assert!(spec.artifacts.iter().any(|item| {
+                    item.kind == ArtifactKind::ModelFile && item.file_name == expected
+                }));
+            }
+        }
+    }
+
+    let qwen_1_7b = model_spec("qwen3-asr-1.7b-int8").unwrap();
     assert!(
-        spec.artifacts
+        qwen_1_7b
+            .artifacts
             .iter()
-            .any(|item| item.kind == ArtifactKind::VadModel)
+            .any(|item| item.kind == ArtifactKind::ModelFile)
     );
 }
 
@@ -129,4 +194,69 @@ fn rejects_a_wrong_checksum_before_publishing() {
         verify_sha256(&path, &"0".repeat(64)).unwrap_err(),
         ModelError::ChecksumMismatch { .. }
     ));
+}
+
+#[test]
+fn marker_validation_does_not_rehash_model_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = ModelManager::new(directory.path().to_path_buf()).unwrap();
+    let expected = b"verified-model";
+    let spec = ModelPackageSpec {
+        artifacts: vec![ArtifactSpec {
+            file_name: "model/model.bin".to_owned(),
+            kind: ArtifactKind::ModelFile,
+            sha256: hex::encode(Sha256::digest(expected)),
+            size: expected.len() as u64,
+            url: "https://example.invalid/model.bin".to_owned(),
+        }],
+        display_name: "Test model".to_owned(),
+        id: "test-model".to_owned(),
+        model_directory: "model",
+        required_files: vec!["model.bin"],
+        revision: "test-revision".to_owned(),
+    };
+    let package = manager.package_dir(&spec);
+    fs::create_dir_all(package.join("model")).unwrap();
+    fs::write(package.join("model/model.bin"), b"changed-model!").unwrap();
+    save_marker(&package.join("install.json"), &spec).unwrap();
+
+    assert!(manager.read_valid_marker(&spec).unwrap().is_some());
+}
+
+#[test]
+fn marker_validation_still_rehashes_the_small_vad_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = ModelManager::new(directory.path().to_path_buf()).unwrap();
+    let model = b"model";
+    let vad = b"verified-vad";
+    let spec = ModelPackageSpec {
+        artifacts: vec![
+            ArtifactSpec {
+                file_name: "model/model.bin".to_owned(),
+                kind: ArtifactKind::ModelFile,
+                sha256: hex::encode(Sha256::digest(model)),
+                size: model.len() as u64,
+                url: "https://example.invalid/model.bin".to_owned(),
+            },
+            ArtifactSpec {
+                file_name: "silero_vad.onnx".to_owned(),
+                kind: ArtifactKind::VadModel,
+                sha256: hex::encode(Sha256::digest(vad)),
+                size: vad.len() as u64,
+                url: "https://example.invalid/silero_vad.onnx".to_owned(),
+            },
+        ],
+        display_name: "Test model".to_owned(),
+        id: "test-model".to_owned(),
+        model_directory: "model",
+        required_files: vec!["model.bin"],
+        revision: "test-revision".to_owned(),
+    };
+    let package = manager.package_dir(&spec);
+    fs::create_dir_all(package.join("model")).unwrap();
+    fs::write(package.join("model/model.bin"), model).unwrap();
+    fs::write(package.join("silero_vad.onnx"), b"changed-vad!").unwrap();
+    save_marker(&package.join("install.json"), &spec).unwrap();
+
+    assert!(manager.read_valid_marker(&spec).unwrap().is_none());
 }

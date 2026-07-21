@@ -37,13 +37,13 @@ flowchart LR
 
 ## Code Modules
 
-- `capture.rs`: Device enumeration and audio capture (CPAL, WASAPI loopback, ScreenCaptureKit).
+- `capture.rs`: System-default audio capture (CPAL, WASAPI loopback, ScreenCaptureKit).
 - `audio/dsp.rs`: Downmixing, gain control, mixing, RMS, and waveform summary.
 - `audio/resample.rs`: Stateful resampling using `rubato`.
 - `audio/flac.rs` & `audio/wav.rs`: Streamed, recoverable audio writers.
 - `storage.rs`: Session directory structure, atomic JSON writes, and startup recovery.
 - `vad.rs`: `sherpa-onnx` Silero VAD implementation.
-- `models.rs` & `asr.rs`: Model validation, download resume, and `sherpa-onnx` Qwen3-ASR engine.
+- `models.rs` & `asr.rs`: Model catalog, validation, download resume, and `sherpa-onnx` Qwen3-ASR recognition.
 - `transcription.rs`: Resumable queue management, ASR loading/unloading.
 - `recording.rs`: Orchestration of real-time audio components.
 - `desktop.rs`: System tray, single-instance lock, and startup configuration.
@@ -56,14 +56,14 @@ flowchart LR
 ## Resource Policy
 
 - **Zero-Dependency UI**: Uses the OS native WebView. Preact is bundled without virtual lists or heavy frameworks.
-- **On-Demand Loading**: The Qwen3-ASR engine is only loaded when speech is detected and unloaded after the configured idle timeout.
+- **On-Demand Loading**: The selected ASR engine is loaded when speech is detected and unloaded after the configured idle timeout.
 - **No Background Processes**: Inference runs inside the Resonote process; no local HTTP servers or sub-processes are spawned.
 
 ## Platform Notes
 
 - **Windows**: Captures system audio via WASAPI Loopback. Requires system WebView2.
 - **macOS**: Captures system audio via ScreenCaptureKit (macOS 13+). Requests Microphone and Screen Recording (for audio capture only) permissions.
-- **Inference defaults**: macOS uses six CPU threads for Qwen3-ASR; Windows keeps the conservative two-thread default. Saved user settings remain authoritative.
+- **Inference defaults**: macOS uses six CPU threads; Windows uses the conservative two-thread default. Saved user settings remain authoritative.
 
 ## Future Extensions
 

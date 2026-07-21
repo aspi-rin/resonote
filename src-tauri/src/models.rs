@@ -23,12 +23,11 @@ mod files;
 pub use catalog::model_catalog;
 use catalog::model_spec;
 use files::{
-    file_matches, missing_status, partial_downloaded_bytes, partial_path, replace_with,
-    save_marker, verify_sha256,
+    file_has_expected_size, file_matches, missing_status, partial_downloaded_bytes, partial_path,
+    replace_with, save_marker, verify_sha256,
 };
 
-const CATALOG_MODEL_ID: &str = "qwen3-asr-0.6b-int8";
-const CATALOG_REVISION: &str = "sherpa-onnx-1.13.4-qwen3-2026-03-25";
+pub const DEFAULT_MODEL_ID: &str = "qwen3-asr-0.6b-int8";
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 pub type ModelStatusObserver = Arc<dyn Fn(ModelDownloadStatus) + Send + Sync + 'static>;
@@ -37,6 +36,7 @@ pub type ModelStatusObserver = Arc<dyn Fn(ModelDownloadStatus) + Send + Sync + '
 #[serde(rename_all = "camelCase")]
 pub enum ArtifactKind {
     ModelArchive,
+    ModelFile,
     VadModel,
 }
 
@@ -54,7 +54,17 @@ pub struct ModelPackageSpec {
     pub artifacts: Vec<ArtifactSpec>,
     pub display_name: String,
     pub id: String,
+    pub model_directory: &'static str,
+    pub required_files: Vec<&'static str>,
     pub revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogEntry {
+    pub display_name: String,
+    pub id: String,
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +97,10 @@ pub struct InstalledModel {
     pub revision: String,
     pub tokenizer: PathBuf,
     pub vad_model: PathBuf,
+}
+
+pub fn is_supported_model(model_id: &str) -> bool {
+    model_spec(model_id).is_ok()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -132,7 +146,7 @@ impl ModelManager {
             install_lock: Mutex::new(()),
             observer,
             root,
-            status: RwLock::new(missing_status(CATALOG_MODEL_ID, 0)),
+            status: RwLock::new(missing_status(DEFAULT_MODEL_ID, 0)),
         })
     }
 
@@ -181,7 +195,7 @@ impl ModelManager {
             return Err(ModelError::NotInstalled(model_id.to_owned()));
         }
         let package = self.package_dir(&spec);
-        let model = model_package::model_directory(&package);
+        let model = model_package::model_directory(&package, spec.model_directory);
         Ok(InstalledModel {
             conv_frontend: model.join("conv_frontend.onnx"),
             decoder: model.join("decoder.int8.onnx"),
@@ -197,6 +211,14 @@ impl ModelManager {
         self.cancel.store(true, Ordering::Release);
     }
 
+    pub fn cancel_install_and_wait(&self) {
+        self.cancel_install();
+        let _guard = self
+            .install_lock
+            .lock()
+            .unwrap_or_else(|item| item.into_inner());
+    }
+
     fn install_package(&self, spec: &ModelPackageSpec) -> Result<ModelDownloadStatus, ModelError> {
         self.cancel.store(false, Ordering::Release);
         let package = self.package_dir(spec);
@@ -208,8 +230,8 @@ impl ModelManager {
                 return self.cancelled(spec, completed, total);
             }
             let final_path = package.join(&artifact.file_name);
-            let extracted =
-                artifact.kind == ArtifactKind::ModelArchive && model_package::is_ready(&package);
+            let extracted = artifact.kind == ArtifactKind::ModelArchive
+                && model_package::is_ready(&package, spec.model_directory, &spec.required_files);
             if extracted || file_matches(&final_path, artifact)? {
                 completed += artifact.size;
                 continue;
@@ -240,17 +262,28 @@ impl ModelManager {
             }
             completed += artifact.size;
         }
-        let archive = spec
+        if !model_package::is_ready(&package, spec.model_directory, &spec.required_files) {
+            let archive = spec
+                .artifacts
+                .iter()
+                .find(|item| item.kind == ArtifactKind::ModelArchive)
+                .ok_or(ModelError::IncompleteCatalog)?;
+            model_package::prepare(
+                &package,
+                &package.join(&archive.file_name),
+                spec.model_directory,
+                &spec.required_files,
+            )?;
+        }
+        for archive in spec
             .artifacts
             .iter()
-            .find(|item| item.kind == ArtifactKind::ModelArchive)
-            .ok_or(ModelError::IncompleteCatalog)?;
-        if !model_package::is_ready(&package) {
-            model_package::prepare(&package, &package.join(&archive.file_name))?;
-        }
-        let archive_path = package.join(&archive.file_name);
-        if archive_path.exists() {
-            fs::remove_file(archive_path)?;
+            .filter(|item| item.kind == ArtifactKind::ModelArchive)
+        {
+            let archive_path = package.join(&archive.file_name);
+            if archive_path.exists() {
+                fs::remove_file(archive_path)?;
+            }
         }
         save_marker(&package.join("install.json"), spec)?;
         let status = ModelDownloadStatus {
@@ -274,6 +307,9 @@ impl ModelManager {
         model_id: &str,
     ) -> Result<(), ModelError> {
         let partial = partial_path(final_path);
+        if let Some(parent) = partial.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let mut existing = partial.metadata().map_or(0, |item| item.len());
         if existing > artifact.size {
             OpenOptions::new()
@@ -374,7 +410,7 @@ impl ModelManager {
         if marker.model_id != spec.id
             || marker.revision != spec.revision
             || marker.artifacts.len() != spec.artifacts.len()
-            || !model_package::is_ready(&package)
+            || !model_package::is_ready(&package, spec.model_directory, &spec.required_files)
         {
             return Ok(None);
         }
@@ -384,10 +420,16 @@ impl ModelManager {
                     && item.sha256 == artifact.sha256
                     && item.size == artifact.size
             });
-            if !marked
-                || (artifact.kind == ArtifactKind::VadModel
-                    && !file_matches(&package.join(&artifact.file_name), artifact)?)
-            {
+            let artifact_is_valid = match artifact.kind {
+                ArtifactKind::ModelArchive => true,
+                ArtifactKind::ModelFile => {
+                    file_has_expected_size(&package.join(&artifact.file_name), artifact)
+                }
+                ArtifactKind::VadModel => {
+                    file_matches(&package.join(&artifact.file_name), artifact)?
+                }
+            };
+            if !marked || !artifact_is_valid {
                 return Ok(None);
             }
         }

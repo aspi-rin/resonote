@@ -16,36 +16,13 @@ use crate::{
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 use super::{
-    CHECKPOINT_INTERVAL, CaptureSession, MAX_BUFFERED_SECONDS, MIX_CHUNK_SAMPLES, RecordingError,
-    RecordingPhase, RecordingStatus, STATUS_INTERVAL, StatusObserver,
+    CHECKPOINT_INTERVAL, MAX_BUFFERED_SECONDS, MIX_CHUNK_SAMPLES, RecordingError, RecordingPhase,
+    RecordingStatus, STATUS_INTERVAL, StatusObserver,
 };
 
 #[derive(Clone, Copy)]
 pub(super) struct SourceConfig {
     pub(super) sample_rate: u32,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct SourceConfigs {
-    pub(super) microphone: Option<SourceConfig>,
-    pub(super) system: Option<SourceConfig>,
-}
-
-impl SourceConfigs {
-    pub(super) fn from_sessions(sessions: &[CaptureSession]) -> Self {
-        let find = |source| {
-            sessions
-                .iter()
-                .find(|session| session.source == source)
-                .map(|session| SourceConfig {
-                    sample_rate: session.sample_rate,
-                })
-        };
-        Self {
-            microphone: find(CaptureSource::Microphone),
-            system: find(CaptureSource::System),
-        }
-    }
 }
 
 pub(super) struct SourcePipeline {
@@ -102,6 +79,10 @@ impl SourcePipeline {
             .drain(..count.min(self.pending.len()))
             .collect()
     }
+
+    fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
 }
 
 #[derive(Debug)]
@@ -111,9 +92,9 @@ pub(super) struct SourceSnapshot {
 }
 
 pub(super) struct RecordingWorkerContext {
-    pub(super) configs: SourceConfigs,
     pub(super) observer: StatusObserver,
     pub(super) settings: AudioSettings,
+    pub(super) source: Arc<RwLock<AudioSourceMode>>,
     pub(super) status: Arc<RwLock<RecordingStatus>>,
     pub(super) transcription: Option<Arc<TranscriptionService>>,
     pub(super) transcription_settings: TranscriptionSettings,
@@ -159,16 +140,9 @@ fn process_audio(
     let started = Instant::now();
     let mut last_checkpoint = started;
     let mut last_status = started - STATUS_INTERVAL;
-    let mut microphone = context
-        .configs
-        .microphone
-        .map(SourcePipeline::new)
-        .transpose()?;
-    let mut system = context
-        .configs
-        .system
-        .map(SourcePipeline::new)
-        .transpose()?;
+    let mut active_source = context.settings.source;
+    let mut microphone = None;
+    let mut system = None;
     let mut output = OutputRouter::new(
         archive,
         context.transcription_settings.clone(),
@@ -178,6 +152,17 @@ fn process_audio(
     )?;
 
     loop {
+        let requested_source = *context
+            .source
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        switch_source(
+            &mut output,
+            requested_source,
+            &mut active_source,
+            &mut microphone,
+            &mut system,
+        );
         if stop.try_recv().is_ok() {
             for event in capture.try_iter() {
                 process_event(event, &mut microphone, &mut system, &context.status)?;
@@ -189,7 +174,13 @@ fn process_audio(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        drain_ready(&mut output, &context.settings, &mut microphone, &mut system)?;
+        drain_ready(
+            &mut output,
+            &context.settings,
+            active_source,
+            &mut microphone,
+            &mut system,
+        )?;
         let now = Instant::now();
         if now.duration_since(last_checkpoint) >= CHECKPOINT_INTERVAL {
             output.archive.checkpoint()?;
@@ -210,13 +201,30 @@ fn process_audio(
     if let Some(pipeline) = system.as_mut() {
         pipeline.finish()?;
     }
-    drain_final(&mut output, &context.settings, &mut microphone, &mut system)?;
+    let requested_source = *context
+        .source
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    switch_source(
+        &mut output,
+        requested_source,
+        &mut active_source,
+        &mut microphone,
+        &mut system,
+    );
+    drain_final(
+        &mut output,
+        &context.settings,
+        active_source,
+        &mut microphone,
+        &mut system,
+    )?;
     output.finish()?;
     output.archive.checkpoint()?;
     Ok(())
 }
 
-fn process_event(
+pub(super) fn process_event(
     event: CaptureEvent,
     microphone: &mut Option<SourcePipeline>,
     system: &mut Option<SourcePipeline>,
@@ -226,11 +234,18 @@ fn process_event(
         CaptureEvent::Audio(audio) => {
             let source = audio.source;
             let pipeline = match source {
-                CaptureSource::Microphone => microphone.as_mut(),
-                CaptureSource::System => system.as_mut(),
+                CaptureSource::Microphone => microphone,
+                CaptureSource::System => system,
+            };
+            if pipeline.is_none() {
+                *pipeline = Some(SourcePipeline::new(SourceConfig {
+                    sample_rate: audio.sample_rate,
+                })?);
             }
-            .ok_or(RecordingError::UnexpectedSource(source))?;
-            let snapshot = pipeline.push(audio)?;
+            let snapshot = pipeline
+                .as_mut()
+                .expect("source pipeline was initialized")
+                .push(audio)?;
             let mut current = status
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -253,20 +268,47 @@ fn process_event(
     }
 }
 
-fn drain_ready(
+pub(super) fn switch_source(
+    output: &mut OutputRouter<'_>,
+    requested: AudioSourceMode,
+    active: &mut AudioSourceMode,
+    microphone: &mut Option<SourcePipeline>,
+    system: &mut Option<SourcePipeline>,
+) {
+    if requested == *active {
+        return;
+    }
+    if let Some(pipeline) = microphone {
+        pipeline.clear_pending();
+    }
+    if let Some(pipeline) = system {
+        pipeline.clear_pending();
+    }
+    output.include_source(requested);
+    *active = requested;
+}
+
+pub(super) fn drain_ready(
     output: &mut OutputRouter<'_>,
     settings: &AudioSettings,
+    source: AudioSourceMode,
     microphone: &mut Option<SourcePipeline>,
     system: &mut Option<SourcePipeline>,
 ) -> Result<(), RecordingError> {
-    match settings.source {
+    match source {
         AudioSourceMode::Microphone => {
+            if let Some(pipeline) = system {
+                pipeline.clear_pending();
+            }
             let count = microphone
                 .as_ref()
                 .map_or(0, |pipeline| pipeline.pending.len());
             write_single(output, microphone, count, settings.microphone_gain)
         }
         AudioSourceMode::System => {
+            if let Some(pipeline) = microphone {
+                pipeline.clear_pending();
+            }
             let count = system.as_ref().map_or(0, |pipeline| pipeline.pending.len());
             write_single(output, system, count, settings.system_gain)
         }
@@ -285,10 +327,11 @@ fn drain_ready(
 fn drain_final(
     output: &mut OutputRouter<'_>,
     settings: &AudioSettings,
+    source: AudioSourceMode,
     microphone: &mut Option<SourcePipeline>,
     system: &mut Option<SourcePipeline>,
 ) -> Result<(), RecordingError> {
-    match settings.source {
+    match source {
         AudioSourceMode::Mixed => {
             let count = microphone
                 .as_ref()
@@ -298,7 +341,7 @@ fn drain_final(
                 });
             write_mixed(output, microphone, system, count, settings)
         }
-        _ => drain_ready(output, settings, microphone, system),
+        _ => drain_ready(output, settings, source, microphone, system),
     }
 }
 
@@ -308,7 +351,9 @@ fn write_single(
     mut count: usize,
     gain: f32,
 ) -> Result<(), RecordingError> {
-    let pipeline = pipeline.as_mut().ok_or(RecordingError::MissingSource)?;
+    let Some(pipeline) = pipeline.as_mut() else {
+        return Ok(());
+    };
     while count > 0 {
         let take = count.min(MIX_CHUNK_SAMPLES);
         let samples: Vec<f32> = pipeline
@@ -329,8 +374,12 @@ fn write_mixed(
     mut count: usize,
     settings: &AudioSettings,
 ) -> Result<(), RecordingError> {
-    let microphone = microphone.as_mut().ok_or(RecordingError::MissingSource)?;
-    let system = system.as_mut().ok_or(RecordingError::MissingSource)?;
+    let Some(microphone) = microphone.as_mut() else {
+        return Ok(());
+    };
+    let Some(system) = system.as_mut() else {
+        return Ok(());
+    };
     while count > 0 {
         let take = count.min(MIX_CHUNK_SAMPLES);
         let mixed = mix_mono(
@@ -381,6 +430,10 @@ impl<'a> OutputRouter<'a> {
             transcription_settings,
             vad,
         })
+    }
+
+    fn include_source(&mut self, source: AudioSourceMode) {
+        self.archive.include_source(source);
     }
 
     pub(super) fn write(&mut self, samples: &[f32]) -> Result<(), RecordingError> {

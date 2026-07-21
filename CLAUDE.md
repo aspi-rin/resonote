@@ -58,6 +58,6 @@ Some modules split large files with `#[path = "..."]` includes — e.g. `recordi
 - **Version bumps** must keep three files in sync: `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`. Then run `npm install --package-lock-only` and `cargo check` to refresh lockfiles.
 - `windows-core` is pinned to `=0.61.2` in Cargo.toml to keep CPAL and Tauri on the same Windows ABI — don't bump it independently.
 - **macOS deployment target**: the repo-root `.cargo/config.toml` pins `MACOSX_DEPLOYMENT_TARGET = "13.0"` to match `minimumSystemVersion` in tauri.conf.json; without it, bare `cargo test` binaries crash at launch (dyld can't resolve the Swift concurrency back-deployment @rpath). The file must stay at the repo root — cargo discovers config from the working directory, not from `--manifest-path`. Keep the version in sync with `minimumSystemVersion`.
-- Resource policy: no background processes, no local HTTP servers, no heavy frontend dependencies. Inference stays in-process.
+- Production runtime policy: the packaged app must not start or bundle background processes or local HTTP servers. Temporary developer tooling such as the Vite dev server is allowed for local preview and testing. Keep frontend dependencies lightweight, and keep inference in-process.
 - `session.json` paths are strictly validated to prevent path traversal — preserve that validation when touching storage code.
 - Clippy runs with `-D warnings`; new warnings fail `npm run verify`.
