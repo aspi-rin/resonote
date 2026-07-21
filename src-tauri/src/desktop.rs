@@ -114,6 +114,17 @@ pub fn handle_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     }
 }
 
+pub fn handle_run_event(app: &AppHandle, event: tauri::RunEvent) {
+    // macOS delivers Dock icon clicks as Reopen, not as a window event, so the
+    // hidden main window has to be restored here.
+    #[cfg(target_os = "macos")]
+    if let tauri::RunEvent::Reopen { .. } = event {
+        show_main_window(app);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, event);
+}
+
 pub fn sync_autostart(app: &AppHandle, enabled: bool) -> Result<bool, String> {
     let manager = app.autolaunch();
     let currently_enabled = manager.is_enabled().map_err(|error| error.to_string())?;

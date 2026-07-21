@@ -259,6 +259,7 @@ pub fn run() {
             start_recording,
             stop_recording
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Resonote");
+        .build(tauri::generate_context!())
+        .expect("failed to run Resonote")
+        .run(desktop::handle_run_event);
 }
