@@ -150,7 +150,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   transcription: {
     language: "auto",
     modelId: "qwen3-asr-0.6b-int8",
-    threads: 2,
+    threads: 6,
     unloadAfterIdleMinutes: 10,
     vad: {
       activationThreshold: 0.5,

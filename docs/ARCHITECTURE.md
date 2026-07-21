@@ -63,6 +63,7 @@ flowchart LR
 
 - **Windows**: Captures system audio via WASAPI Loopback. Requires system WebView2.
 - **macOS**: Captures system audio via ScreenCaptureKit (macOS 13+). Requests Microphone and Screen Recording (for audio capture only) permissions.
+- **Inference defaults**: macOS uses six CPU threads for Qwen3-ASR; Windows keeps the conservative two-thread default. Saved user settings remain authoritative.
 
 ## Future Extensions
 
