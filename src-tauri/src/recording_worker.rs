@@ -8,7 +8,7 @@ use std::{
 use crate::{
     audio::{AudioBlock, StreamResampler, TARGET_SAMPLE_RATE, mix_mono, rms_db, waveform_bins},
     capture::{CaptureEvent, CaptureSource, CapturedAudio},
-    settings::{AudioSettings, AudioSourceMode, TranscriptionSettings},
+    settings::{AudioSettings, AudioSourceMode, TranscriptionSettings, TranslationSettings},
     storage::{RecordingArchive, SessionManifest},
     transcription::TranscriptionService,
     vad::{VadOutput, VoiceActivitySegmenter},
@@ -98,6 +98,7 @@ pub(super) struct RecordingWorkerContext {
     pub(super) status: Arc<RwLock<RecordingStatus>>,
     pub(super) transcription: Option<Arc<TranscriptionService>>,
     pub(super) transcription_settings: TranscriptionSettings,
+    pub(super) translation_settings: TranslationSettings,
     pub(super) vad_model: Option<PathBuf>,
 }
 
@@ -146,6 +147,7 @@ fn process_audio(
     let mut output = OutputRouter::new(
         archive,
         context.transcription_settings.clone(),
+        context.translation_settings.clone(),
         context.transcription.clone(),
         context.status.clone(),
         context.vad_model.as_deref(),
@@ -401,6 +403,7 @@ pub(super) struct OutputRouter<'a> {
     pub(super) status: Arc<RwLock<RecordingStatus>>,
     pub(super) transcription: Option<Arc<TranscriptionService>>,
     pub(super) transcription_settings: TranscriptionSettings,
+    pub(super) translation_settings: TranslationSettings,
     vad: Option<VoiceActivitySegmenter>,
 }
 
@@ -408,6 +411,7 @@ impl<'a> OutputRouter<'a> {
     pub(super) fn new(
         archive: &'a mut RecordingArchive,
         transcription_settings: TranscriptionSettings,
+        translation_settings: TranslationSettings,
         transcription: Option<Arc<TranscriptionService>>,
         status: Arc<RwLock<RecordingStatus>>,
         vad_model: Option<&std::path::Path>,
@@ -428,6 +432,7 @@ impl<'a> OutputRouter<'a> {
             status,
             transcription,
             transcription_settings,
+            translation_settings,
             vad,
         })
     }
@@ -474,6 +479,7 @@ impl<'a> OutputRouter<'a> {
                     &self.session_id,
                     &segment,
                     &self.transcription_settings,
+                    &self.translation_settings,
                 ) {
                     self.report_transcription_error(error.to_string());
                 }

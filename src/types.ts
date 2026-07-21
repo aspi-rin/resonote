@@ -34,6 +34,12 @@ export interface AppSettings {
     unloadAfterIdleMinutes: number;
     vad: VadConfig;
   };
+  translation: {
+    enabled: boolean;
+    endpoint: string;
+    model: string;
+    targetLanguage: string;
+  };
 }
 
 export interface RecordingStatus {
@@ -91,6 +97,34 @@ export interface TranscriptSegmentUpdate {
   sessionId: string;
 }
 
+export type TranslationSegmentStatus = "pending" | "processing" | "complete" | "failed";
+export type TranslationDocumentStatus = "pending" | "processing" | "complete" | "partial";
+
+export interface TranslationSegment {
+  attempts: number;
+  error: string | null;
+  segmentId: number;
+  sourceText: string;
+  status: TranslationSegmentStatus;
+  text: string;
+}
+
+export interface TranslationSegmentUpdate {
+  segment: TranslationSegment;
+  sessionId: string;
+}
+
+export interface TranslationDocument {
+  endpoint: string;
+  model: string;
+  schemaVersion: number;
+  segments: TranslationSegment[];
+  sessionId: string;
+  status: TranslationDocumentStatus;
+  targetLanguage: string;
+  updatedAt: string;
+}
+
 export interface TranscriptDocument {
   forcedLanguage: string;
   modelId: string;
@@ -125,6 +159,9 @@ export interface HistoryEntry {
   transcriptPreview: string;
   transcriptSegmentCount: number;
   transcriptStatus: "pending" | "processing" | "complete" | "partial" | null;
+  translationPreview: string;
+  translationStatus: TranslationDocumentStatus | null;
+  translationTargetLanguage: string | null;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -154,6 +191,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
       minSilenceMs: 500,
       minSpeechMs: 250,
     },
+  },
+  translation: {
+    enabled: true,
+    endpoint: "http://127.0.0.1:8000/v1",
+    model: "Hy-MT2-1.8B",
+    targetLanguage: "Chinese",
   },
 };
 

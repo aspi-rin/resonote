@@ -17,6 +17,7 @@ pub mod recording;
 pub mod settings;
 pub mod storage;
 pub mod transcription;
+pub mod translation;
 pub mod vad;
 
 use history::{HistoryEntry, HistoryService};
@@ -26,6 +27,7 @@ use settings::{AppSettings, AudioSourceMode, SettingsStore};
 use transcription::{
     TranscriptDocument, TranscriptSegmentUpdate, TranscriptionService, TranscriptionStatus,
 };
+use translation::{TranslationDocument, TranslationSegmentUpdate, TranslationService};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -105,7 +107,7 @@ fn start_recording(
 ) -> Result<RecordingStatus, String> {
     let settings = settings.snapshot();
     recording
-        .start(settings.audio, settings.transcription)
+        .start(settings.audio, settings.transcription, settings.translation)
         .map_err(|error| error.to_string())
 }
 
@@ -174,6 +176,16 @@ fn get_session_transcript(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn get_session_translation(
+    state: tauri::State<'_, HistoryService>,
+    session_id: String,
+) -> Result<Option<TranslationDocument>, String> {
+    state
+        .session_translation(&session_id)
+        .map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -221,6 +233,20 @@ pub fn run() {
                 app.path().app_local_data_dir()?.join("models"),
                 model_observer,
             )?);
+            let translation_event_app = app.handle().clone();
+            let translation_observer = Arc::new(move |update: TranslationSegmentUpdate| {
+                if let Err(error) = translation_event_app.emit("translation-segment", update) {
+                    tracing::debug!(?error, "translation segment event had no listener");
+                }
+            });
+            let translation = Arc::new(TranslationService::new(translation_observer)?);
+            let recovered_translations = translation.recover_root(&recordings_root)?;
+            if recovered_translations > 0 {
+                tracing::info!(
+                    recovered_translations,
+                    "recovered pending translation sessions"
+                );
+            }
             let transcription_event_app = app.handle().clone();
             let transcription_observer = Arc::new(move |status: TranscriptionStatus| {
                 if let Err(error) = transcription_event_app.emit("transcription-status", status) {
@@ -233,10 +259,24 @@ pub fn run() {
                     tracing::debug!(?error, "transcript segment event had no listener");
                 }
             });
-            let transcription = Arc::new(TranscriptionService::with_observers(
+            let completion_translation = translation.clone();
+            let completion_observer: transcription::CompletionObserver =
+                Arc::new(move |session_dir, session_id, settings, segment| {
+                    if let Err(error) = completion_translation.enqueue(
+                        &session_dir,
+                        &session_id,
+                        segment.id,
+                        &segment.text,
+                        &settings,
+                    ) {
+                        tracing::warn!(?error, "failed to queue transcript translation");
+                    }
+                });
+            let transcription = Arc::new(TranscriptionService::with_completion_observer(
                 model_manager.clone(),
                 transcription_observer,
                 segment_observer,
+                completion_observer,
             ));
             let recovered_transcripts = transcription.recover_root(&recordings_root)?;
             if recovered_transcripts > 0 {
@@ -265,12 +305,15 @@ pub fn run() {
             ));
             app.manage(tray);
             app.manage(transcription);
+            app.manage(translation);
             app.manage(model_manager);
             if startup_settings.desktop.start_recording_on_launch {
                 let recording = app.state::<RecordingService>();
-                if let Err(error) =
-                    recording.start(startup_settings.audio, startup_settings.transcription)
-                {
+                if let Err(error) = recording.start(
+                    startup_settings.audio,
+                    startup_settings.transcription,
+                    startup_settings.translation,
+                ) {
                     tracing::error!(?error, "failed to start launch recording");
                 }
             }
@@ -284,6 +327,7 @@ pub fn run() {
             get_model_status,
             get_recording_status,
             get_session_transcript,
+            get_session_translation,
             get_transcription_status,
             install_model,
             list_recording_history,

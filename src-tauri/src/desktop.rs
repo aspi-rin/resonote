@@ -163,7 +163,7 @@ fn toggle_recording(app: &AppHandle) {
         RecordingPhase::Idle | RecordingPhase::Failed => {
             let settings = app.state::<SettingsStore>().snapshot();
             if let Err(error) = recording
-                .start(settings.audio, settings.transcription)
+                .start(settings.audio, settings.transcription, settings.translation)
                 .map(|_| ())
             {
                 tracing::error!(?error, "tray recording action failed");

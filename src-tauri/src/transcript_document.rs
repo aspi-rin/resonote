@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use super::{DOCUMENT_NAME, TranscriptionError};
-use crate::audio::TARGET_SAMPLE_RATE;
+use crate::{audio::TARGET_SAMPLE_RATE, settings::TranslationSettings};
 
 const MAX_ATTEMPTS: u32 = 3;
 
@@ -87,6 +87,8 @@ pub struct TranscriptDocument {
     pub session_id: String,
     pub status: TranscriptDocumentStatus,
     pub threads: u16,
+    #[serde(default)]
+    pub translation: TranslationSettings,
     pub unload_after_idle_minutes: u32,
     pub updated_at: DateTime<Utc>,
 }

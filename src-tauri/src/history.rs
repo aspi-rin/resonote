@@ -16,10 +16,12 @@ use crate::{
         TranscriptDocument, TranscriptDocumentStatus, TranscriptSegmentStatus, TranscriptionError,
         TranscriptionService,
     },
+    translation::{TranslationDocument, TranslationDocumentStatus, TranslationSegmentStatus},
 };
 
 const MANIFEST_NAME: &str = "session.json";
 const TRANSCRIPT_NAME: &str = "transcript.json";
+const TRANSLATION_NAME: &str = "translation.json";
 const MAX_SCAN_DEPTH: usize = 5;
 const MAX_HISTORY_LIMIT: usize = 500;
 
@@ -38,6 +40,9 @@ pub struct HistoryEntry {
     pub transcript_preview: String,
     pub transcript_segment_count: usize,
     pub transcript_status: Option<TranscriptDocumentStatus>,
+    pub translation_preview: String,
+    pub translation_status: Option<TranslationDocumentStatus>,
+    pub translation_target_language: Option<String>,
 }
 
 pub struct HistoryService {
@@ -141,6 +146,25 @@ impl HistoryService {
         }
         Ok(Some(serde_json::from_slice(&fs::read(transcript_path)?)?))
     }
+
+    pub fn session_translation(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<TranslationDocument>, HistoryError> {
+        if session_id.trim().is_empty() {
+            return Err(HistoryError::InvalidSessionId);
+        }
+        let entry = self
+            .list(MAX_HISTORY_LIMIT)?
+            .into_iter()
+            .find(|entry| entry.session_id == session_id)
+            .ok_or_else(|| HistoryError::SessionNotFound(session_id.to_owned()))?;
+        let translation_path = entry.directory.join(TRANSLATION_NAME);
+        if !translation_path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&fs::read(translation_path)?)?))
+    }
 }
 
 fn history_entry(manifest_path: &Path) -> Result<HistoryEntry, HistoryError> {
@@ -153,6 +177,14 @@ fn history_entry(manifest_path: &Path) -> Result<HistoryEntry, HistoryError> {
     let transcript = if transcript_path.exists() {
         Some(serde_json::from_slice::<TranscriptDocument>(&fs::read(
             transcript_path,
+        )?)?)
+    } else {
+        None
+    };
+    let translation_path = directory.join(TRANSLATION_NAME);
+    let translation = if translation_path.exists() {
+        Some(serde_json::from_slice::<TranslationDocument>(&fs::read(
+            translation_path,
         )?)?)
     } else {
         None
@@ -179,6 +211,12 @@ fn history_entry(manifest_path: &Path) -> Result<HistoryEntry, HistoryError> {
         transcript_preview,
         transcript_segment_count: transcript.as_ref().map_or(0, |item| item.segments.len()),
         transcript_status: transcript.map(|item| item.status),
+        translation_preview: translation
+            .as_ref()
+            .map(translation_preview)
+            .unwrap_or_default(),
+        translation_status: translation.as_ref().map(|item| item.status),
+        translation_target_language: translation.map(|item| item.target_language),
     })
 }
 
@@ -187,6 +225,22 @@ fn transcript_preview(document: &TranscriptDocument) -> String {
         .segments
         .iter()
         .filter(|segment| segment.status == TranscriptSegmentStatus::Complete)
+        .map(|segment| segment.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut preview = joined.chars().take(160).collect::<String>();
+    if joined.chars().count() > 160 {
+        preview.push('…');
+    }
+    preview
+}
+
+fn translation_preview(document: &TranslationDocument) -> String {
+    let joined = document
+        .segments
+        .iter()
+        .filter(|segment| segment.status == TranslationSegmentStatus::Complete)
         .map(|segment| segment.text.trim())
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
@@ -330,6 +384,7 @@ mod tests {
             session_id: manifest.session_id.clone(),
             status: TranscriptDocumentStatus::Complete,
             threads: 2,
+            translation: crate::settings::TranslationSettings::default(),
             unload_after_idle_minutes: 10,
             updated_at: Utc::now(),
         };
