@@ -19,11 +19,10 @@ pub mod storage;
 pub mod transcription;
 pub mod vad;
 
-use capture::AudioDeviceDescriptor;
 use history::{HistoryEntry, HistoryService};
-use models::{ModelDownloadStatus, ModelManager};
+use models::{ModelCatalogEntry, ModelDownloadStatus, ModelManager};
 use recording::{RecordingService, RecordingStatus};
-use settings::{AppSettings, SettingsStore};
+use settings::{AppSettings, AudioSourceMode, SettingsStore};
 use transcription::{
     TranscriptDocument, TranscriptSegmentUpdate, TranscriptionService, TranscriptionStatus,
 };
@@ -41,11 +40,6 @@ fn app_info() -> AppInfo {
         name: "Resonote",
         version: env!("CARGO_PKG_VERSION"),
     }
-}
-
-#[tauri::command]
-fn list_audio_devices() -> Result<Vec<AudioDeviceDescriptor>, String> {
-    capture::list_audio_devices().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -100,6 +94,11 @@ fn get_recording_status(state: tauri::State<'_, RecordingService>) -> RecordingS
 }
 
 #[tauri::command]
+fn list_transcription_models() -> Vec<ModelCatalogEntry> {
+    models::model_catalog()
+}
+
+#[tauri::command]
 fn start_recording(
     recording: tauri::State<'_, RecordingService>,
     settings: tauri::State<'_, SettingsStore>,
@@ -113,6 +112,17 @@ fn start_recording(
 #[tauri::command]
 async fn stop_recording(app: tauri::AppHandle) -> Result<RecordingStatus, String> {
     tauri::async_runtime::spawn_blocking(move || app.state::<RecordingService>().stop())
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn set_recording_source(
+    app: tauri::AppHandle,
+    source: AudioSourceMode,
+) -> Result<RecordingStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<RecordingService>().set_source(source))
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())
@@ -139,8 +149,12 @@ async fn install_model(
 }
 
 #[tauri::command]
-fn cancel_model_install(state: tauri::State<'_, Arc<ModelManager>>) {
-    state.cancel_install();
+async fn cancel_model_install(state: tauri::State<'_, Arc<ModelManager>>) -> Result<(), String> {
+    let manager = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.cancel_install_and_wait())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -272,10 +286,11 @@ pub fn run() {
             get_session_transcript,
             get_transcription_status,
             install_model,
-            list_audio_devices,
             list_recording_history,
+            list_transcription_models,
             open_recording_directory,
             save_settings,
+            set_recording_source,
             start_recording,
             stop_recording
         ])

@@ -21,7 +21,7 @@ The following tests require physical audio devices and are ignored by default. R
 cargo test --manifest-path src-tauri/Cargo.toml opens_default_system_loopback_stream -- --ignored --nocapture
 cargo test --manifest-path src-tauri/Cargo.toml records_default_system_loopback_to_disk -- --ignored --nocapture
 cargo test --manifest-path src-tauri/Cargo.toml records_default_mixed_sources_to_disk -- --ignored --nocapture
-cargo test --manifest-path src-tauri/Cargo.toml enumerates_host_audio_devices -- --ignored --nocapture
+cargo test --manifest-path src-tauri/Cargo.toml switches_default_sources_while_recording -- --ignored --nocapture
 ```
 *Note: Ensure audio is playing and input devices are not locked by other applications before running.*
 

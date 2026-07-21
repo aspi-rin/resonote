@@ -146,6 +146,12 @@ impl RecordingArchive {
         save_manifest(&self.manifest_path, &self.manifest)
     }
 
+    pub fn include_source(&mut self, source: AudioSourceMode) {
+        if self.manifest.audio_source != source {
+            self.manifest.audio_source = AudioSourceMode::Mixed;
+        }
+    }
+
     pub fn complete(mut self) -> Result<SessionManifest, StorageError> {
         self.finalize_active_segment()?;
         self.manifest.status = ArchiveStatus::Completed;

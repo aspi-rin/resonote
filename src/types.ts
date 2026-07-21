@@ -14,12 +14,10 @@ export interface VadConfig {
 export interface AppSettings {
   audio: {
     format: AudioFormat;
-    microphoneDeviceId: string | null;
     microphoneGain: number;
     outputDirectory: string | null;
     segmentMinutes: number;
     source: AudioSourceMode;
-    systemDeviceId: string | null;
     systemGain: number;
   };
   desktop: {
@@ -38,14 +36,8 @@ export interface AppSettings {
   };
 }
 
-export interface AudioDevice {
-  id: string;
-  isDefault: boolean;
-  name: string;
-  source: "microphone" | "system";
-}
-
 export interface RecordingStatus {
+  audioSource: AudioSourceMode;
   capturedSamples: number;
   elapsedMs: number;
   error: string | null;
@@ -69,6 +61,12 @@ export interface ModelDownloadStatus {
   error: string | null;
   modelId: string;
   phase: "missing" | "downloading" | "downloaded" | "failed" | "cancelled";
+  totalBytes: number;
+}
+
+export interface ModelCatalogEntry {
+  displayName: string;
+  id: string;
   totalBytes: number;
 }
 
@@ -132,12 +130,10 @@ export interface HistoryEntry {
 export const DEFAULT_SETTINGS: AppSettings = {
   audio: {
     format: "flac",
-    microphoneDeviceId: null,
     microphoneGain: 1,
     outputDirectory: null,
     segmentMinutes: 60,
     source: "mixed",
-    systemDeviceId: null,
     systemGain: 1,
   },
   desktop: {
@@ -162,6 +158,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
 };
 
 export const DEFAULT_RECORDING_STATUS: RecordingStatus = {
+  audioSource: "mixed",
   capturedSamples: 0,
   elapsedMs: 0,
   error: null,

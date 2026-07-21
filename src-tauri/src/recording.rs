@@ -11,9 +11,7 @@ use thiserror::Error;
 
 use crate::{
     audio::{AudioBlockError, ResampleStreamError},
-    capture::{
-        CaptureError, CaptureEvent, CaptureRequest, CaptureSession, CaptureSource, start_capture,
-    },
+    capture::{CaptureError, CaptureEvent, CaptureSession, CaptureSource, start_capture},
     models::{ModelError, ModelManager},
     settings::{AudioSettings, AudioSourceMode, TranscriptionSettings},
     storage::{RecordingArchive, SessionManifest, StorageError, recover_interrupted_sessions},
@@ -41,6 +39,7 @@ pub enum RecordingPhase {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingStatus {
+    pub audio_source: AudioSourceMode,
     pub captured_samples: u64,
     pub elapsed_ms: u64,
     pub error: Option<String>,
@@ -61,6 +60,7 @@ pub struct RecordingStatus {
 impl Default for RecordingStatus {
     fn default() -> Self {
         Self {
+            audio_source: AudioSourceMode::Mixed,
             captured_samples: 0,
             elapsed_ms: 0,
             error: None,
@@ -148,13 +148,13 @@ impl RecordingService {
         recover_interrupted_sessions(&output_root)?;
         let archive = RecordingArchive::create(&output_root, &settings)?;
         self.replace_status(RecordingStatus {
+            audio_source: settings.source,
             phase: RecordingPhase::Starting,
             ..RecordingStatus::default()
         });
         let (capture_sender, capture_receiver) = crossbeam_channel::unbounded();
         let mut sessions = Vec::new();
-        let capture_result = open_requested_sources(&settings, &capture_sender, &mut sessions);
-        drop(capture_sender);
+        let capture_result = ensure_sources(settings.source, &capture_sender, &mut sessions);
         if let Err(error) = capture_result {
             drop(sessions);
             let _ = archive.fail(error.to_string());
@@ -170,10 +170,11 @@ impl RecordingService {
             .iter()
             .find(|session| session.source == CaptureSource::System)
             .map(|session| session.device_name.clone());
-        let source_configs = SourceConfigs::from_sessions(&sessions);
+        let source = Arc::new(RwLock::new(settings.source));
         let session_directory = archive.session_dir().to_path_buf();
         let session_id = archive.manifest().session_id.clone();
         let recording_status = RecordingStatus {
+            audio_source: settings.source,
             microphone_device,
             phase: RecordingPhase::Recording,
             session_directory: Some(session_directory),
@@ -187,9 +188,9 @@ impl RecordingService {
         let observer = self.observer.clone();
         let transcription = self.transcription.clone();
         let context = RecordingWorkerContext {
-            configs: source_configs,
             observer,
             settings: settings.clone(),
+            source: source.clone(),
             status,
             transcription,
             transcription_settings,
@@ -209,11 +210,46 @@ impl RecordingService {
                 RecordingError::Thread(error)
             })?;
         *active = Some(ActiveRecording {
+            capture_sender,
             sessions,
+            source,
             stop_sender,
             worker,
         });
         Ok(recording_status)
+    }
+
+    pub fn set_source(&self, source: AudioSourceMode) -> Result<RecordingStatus, RecordingError> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reap_finished(&mut active);
+        let Some(recording) = active.as_mut() else {
+            return Err(RecordingError::NotRecording);
+        };
+        ensure_sources(source, &recording.capture_sender, &mut recording.sessions)?;
+        *recording
+            .source
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = source;
+        let microphone_device = recording
+            .sessions
+            .iter()
+            .find(|session| session.source == CaptureSource::Microphone)
+            .map(|session| session.device_name.clone());
+        let system_device = recording
+            .sessions
+            .iter()
+            .find(|session| session.source == CaptureSource::System)
+            .map(|session| session.device_name.clone());
+        drop(active);
+        self.mutate_status(|status| {
+            status.audio_source = source;
+            status.microphone_device = microphone_device;
+            status.system_device = system_device;
+        });
+        Ok(self.status())
     }
 
     pub fn stop(&self) -> Result<RecordingStatus, RecordingError> {
@@ -278,7 +314,9 @@ impl RecordingService {
 }
 
 struct ActiveRecording {
+    capture_sender: Sender<CaptureEvent>,
     sessions: Vec<CaptureSession>,
+    source: Arc<RwLock<AudioSourceMode>>,
     stop_sender: Sender<()>,
     worker: JoinHandle<Result<SessionManifest, RecordingError>>,
 }
@@ -296,42 +334,34 @@ fn reap_finished(active: &mut Option<ActiveRecording>) {
     }
 }
 
-fn open_requested_sources(
-    settings: &AudioSettings,
+fn ensure_sources(
+    mode: AudioSourceMode,
     sender: &Sender<CaptureEvent>,
     sessions: &mut Vec<CaptureSession>,
 ) -> Result<(), RecordingError> {
-    if matches!(
-        settings.source,
-        AudioSourceMode::Microphone | AudioSourceMode::Mixed
-    ) {
-        sessions.push(start_capture(
-            CaptureRequest {
-                device_id: settings.microphone_device_id.clone(),
-                source: CaptureSource::Microphone,
-            },
-            sender.clone(),
-        )?);
-    }
-    if matches!(
-        settings.source,
-        AudioSourceMode::System | AudioSourceMode::Mixed
-    ) {
-        sessions.push(start_capture(
-            CaptureRequest {
-                device_id: settings.system_device_id.clone(),
-                source: CaptureSource::System,
-            },
-            sender.clone(),
-        )?);
+    for source in [CaptureSource::Microphone, CaptureSource::System] {
+        if source_is_enabled(mode, source)
+            && !sessions.iter().any(|session| session.source == source)
+        {
+            sessions.push(start_capture(source, sender.clone())?);
+        }
     }
     Ok(())
+}
+
+fn source_is_enabled(mode: AudioSourceMode, source: CaptureSource) -> bool {
+    matches!(
+        (mode, source),
+        (AudioSourceMode::Microphone, CaptureSource::Microphone)
+            | (AudioSourceMode::System, CaptureSource::System)
+            | (AudioSourceMode::Mixed, _)
+    )
 }
 
 #[path = "recording_worker.rs"]
 mod worker;
 
-use worker::{RecordingWorkerContext, SourceConfigs, recording_worker};
+use worker::{RecordingWorkerContext, recording_worker};
 
 #[derive(Debug, Error)]
 pub enum RecordingError {
@@ -356,8 +386,6 @@ pub enum RecordingError {
         capture_source: CaptureSource,
         message: String,
     },
-    #[error("recording source pipeline is missing")]
-    MissingSource,
     #[error("recording service has no model manager for sherpa-onnx VAD")]
     MissingModelManager,
     #[error(transparent)]
@@ -378,8 +406,6 @@ pub enum RecordingError {
     Storage(#[from] StorageError),
     #[error("failed to start recording worker: {0}")]
     Thread(std::io::Error),
-    #[error("received audio from inactive source {0:?}")]
-    UnexpectedSource(CaptureSource),
     #[error(transparent)]
     Vad(#[from] VadError),
     #[error("recording worker panicked")]

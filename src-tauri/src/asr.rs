@@ -24,9 +24,9 @@ impl SherpaAsrRecognizer {
         }
         let model = manager.installed_model(model_id)?;
         let mut config = OfflineRecognizerConfig::default();
-        config.feat_config.feature_dim = 128;
         config.model_config.num_threads = i32::from(threads);
         config.model_config.provider = Some("cpu".to_owned());
+        config.feat_config.feature_dim = 128;
         config.model_config.qwen3_asr = OfflineQwen3ASRModelConfig {
             conv_frontend: Some(path_string(&model.conv_frontend)?),
             encoder: Some(path_string(&model.encoder)?),
@@ -51,17 +51,17 @@ impl SherpaAsrRecognizer {
         let path = path_string(wav_path)?;
         let wave = Wave::read(&path).ok_or_else(|| AsrError::ReadWave(wav_path.to_path_buf()))?;
         let stream = self.recognizer.create_stream();
-        if let Some(language) = forced_language
+        let requested_language = forced_language
             .map(str::trim)
-            .filter(|item| !item.is_empty())
-        {
+            .filter(|item| !item.is_empty());
+        if let Some(language) = requested_language {
             stream.set_option("language", language);
         }
         stream.accept_waveform(wave.sample_rate(), wave.samples());
         self.recognizer.decode(&stream);
         let result = stream.get_result().ok_or(AsrError::MissingResult)?;
         Ok(AsrTranscription {
-            language: forced_language.unwrap_or_default().to_owned(),
+            language: requested_language.unwrap_or_default().to_owned(),
             text: result.text.trim().to_owned(),
         })
     }
@@ -75,7 +75,7 @@ fn path_string(path: &Path) -> Result<String, AsrError> {
 
 #[derive(Debug, Error)]
 pub enum AsrError {
-    #[error("sherpa-onnx could not create the Qwen3-ASR recognizer")]
+    #[error("sherpa-onnx could not create the ASR recognizer")]
     CreateRecognizer,
     #[error("ASR thread count must be between 1 and 16, received {0}")]
     InvalidThreads(u16),
