@@ -3,7 +3,11 @@ use super::worker::{
     recording_worker, switch_source,
 };
 use super::*;
-use crate::{audio::TARGET_SAMPLE_RATE, capture::CapturedAudio, settings::AudioFormat};
+use crate::{
+    audio::TARGET_SAMPLE_RATE,
+    capture::CapturedAudio,
+    settings::{AudioFormat, TranslationSettings},
+};
 use claxon::FlacReader;
 use std::time::Instant;
 
@@ -48,6 +52,7 @@ fn mixes_synthetic_microphone_and_system_audio() {
             status: status.clone(),
             transcription: None,
             transcription_settings: TranscriptionSettings::default(),
+            translation_settings: TranslationSettings::default(),
             vad_model: None,
         },
     )
@@ -87,6 +92,7 @@ fn switches_audio_source_without_restarting_the_archive() {
         let mut output = OutputRouter::new(
             &mut archive,
             TranscriptionSettings::default(),
+            TranslationSettings::default(),
             None,
             status,
             None,
@@ -193,6 +199,7 @@ fn archives_silence_without_vad_in_recording_only_test_service() {
         let mut output = OutputRouter::new(
             &mut archive,
             TranscriptionSettings::default(),
+            TranslationSettings::default(),
             None,
             status.clone(),
             None,
@@ -226,7 +233,11 @@ fn missing_vad_model_does_not_leave_recording_in_starting_phase() {
     );
 
     assert!(matches!(
-        service.start(AudioSettings::default(), TranscriptionSettings::default()),
+        service.start(
+            AudioSettings::default(),
+            TranscriptionSettings::default(),
+            TranslationSettings::default(),
+        ),
         Err(RecordingError::Model(ModelError::NotInstalled(_)))
     ));
     assert_eq!(service.status().phase, RecordingPhase::Idle);
@@ -245,7 +256,11 @@ fn records_default_system_loopback_to_disk() {
     };
 
     service
-        .start(settings, TranscriptionSettings::default())
+        .start(
+            settings,
+            TranscriptionSettings::default(),
+            TranslationSettings::default(),
+        )
         .unwrap();
     thread::sleep(Duration::from_secs(1));
     let stopped = service.stop().unwrap();
@@ -274,7 +289,11 @@ fn records_default_mixed_sources_to_disk() {
     };
 
     service
-        .start(settings, TranscriptionSettings::default())
+        .start(
+            settings,
+            TranscriptionSettings::default(),
+            TranslationSettings::default(),
+        )
         .unwrap();
     thread::sleep(Duration::from_secs(1));
     let stopped = service.stop().unwrap();
@@ -298,7 +317,11 @@ fn switches_default_sources_while_recording() {
     };
 
     service
-        .start(settings, TranscriptionSettings::default())
+        .start(
+            settings,
+            TranscriptionSettings::default(),
+            TranslationSettings::default(),
+        )
         .unwrap();
     thread::sleep(Duration::from_millis(250));
     let system = service.set_source(AudioSourceMode::System).unwrap();

@@ -27,6 +27,7 @@ fn durably_enqueues_speech_without_an_installed_model() {
             "session-1",
             &segment,
             &TranscriptionSettings::default(),
+            &TranslationSettings::default(),
         )
         .unwrap();
     let document = load_document(&session.join(DOCUMENT_NAME)).unwrap();
@@ -67,6 +68,7 @@ fn notifies_segment_observer_when_speech_is_enqueued() {
             "session-1",
             &segment,
             &TranscriptionSettings::default(),
+            &TranslationSettings::default(),
         )
         .unwrap();
 
@@ -141,6 +143,7 @@ fn recovery_returns_processing_segments_to_pending() {
         session_id: "session-1".to_owned(),
         status: TranscriptDocumentStatus::Processing,
         threads: 2,
+        translation: TranslationSettings::default(),
         unload_after_idle_minutes: 10,
         updated_at: Utc::now(),
     };
@@ -174,6 +177,7 @@ fn deleting_a_session_removes_its_pending_queue_count() {
             "session-1",
             &segment,
             &TranscriptionSettings::default(),
+            &TranslationSettings::default(),
         )
         .unwrap();
     assert_eq!(service.status().pending_segments, 1);

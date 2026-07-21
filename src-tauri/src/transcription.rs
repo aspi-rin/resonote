@@ -16,7 +16,7 @@ use crate::{
     asr::{AsrError, SherpaAsrRecognizer},
     audio::{RecoverableWavWriter, TARGET_SAMPLE_RATE, WavError},
     models::{ModelError, ModelManager},
-    settings::TranscriptionSettings,
+    settings::{TranscriptionSettings, TranslationSettings},
     vad::SpeechSegment,
 };
 
@@ -25,6 +25,8 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub type TranscriptionObserver = Arc<dyn Fn(TranscriptionStatus) + Send + Sync + 'static>;
 pub type SegmentObserver = Arc<dyn Fn(TranscriptSegmentUpdate) + Send + Sync + 'static>;
+pub type CompletionObserver =
+    Arc<dyn Fn(PathBuf, String, TranslationSettings, TranscriptSegment) + Send + Sync + 'static>;
 
 #[path = "transcription_delete.rs"]
 mod deletion;
@@ -49,6 +51,7 @@ struct TranscriptionInner {
     document_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     known_sessions: Mutex<HashSet<PathBuf>>,
     manager: Arc<ModelManager>,
+    completion_observer: CompletionObserver,
     observer: TranscriptionObserver,
     segment_observer: SegmentObserver,
     status: RwLock<TranscriptionStatus>,
@@ -69,7 +72,22 @@ impl TranscriptionService {
         observer: TranscriptionObserver,
         segment_observer: SegmentObserver,
     ) -> Self {
+        Self::with_completion_observer(
+            manager,
+            observer,
+            segment_observer,
+            Arc::new(|_, _, _, _| {}),
+        )
+    }
+
+    pub fn with_completion_observer(
+        manager: Arc<ModelManager>,
+        observer: TranscriptionObserver,
+        segment_observer: SegmentObserver,
+        completion_observer: CompletionObserver,
+    ) -> Self {
         let inner = Arc::new(TranscriptionInner {
+            completion_observer,
             document_locks: Mutex::new(HashMap::new()),
             known_sessions: Mutex::new(HashSet::new()),
             manager,
@@ -97,6 +115,7 @@ impl TranscriptionService {
         session_id: &str,
         segment: &SpeechSegment,
         settings: &TranscriptionSettings,
+        translation_settings: &TranslationSettings,
     ) -> Result<TranscriptSegment, TranscriptionError> {
         let lock = self.inner.document_lock(session_dir);
         let document_guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -112,6 +131,7 @@ impl TranscriptionService {
                 session_id: session_id.to_owned(),
                 status: TranscriptDocumentStatus::Pending,
                 threads: settings.threads,
+                translation: translation_settings.clone(),
                 unload_after_idle_minutes: settings.unload_after_idle_minutes,
                 updated_at: Utc::now(),
             }
@@ -395,45 +415,61 @@ fn process_session(
         recognizer.last_used = Instant::now();
     }
 
-    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut latest = load_document(&path)?;
-    let item = latest
-        .segments
-        .iter_mut()
-        .find(|item| item.id == segment_id)
-        .ok_or(TranscriptionError::SegmentMissing(segment_id))?;
-    match result {
-        Ok(transcription) => {
-            item.detected_language = transcription.language;
-            item.error = None;
-            item.status = TranscriptSegmentStatus::Complete;
-            item.text = transcription.text;
+    let (session_id, translation_settings, resolved_snapshot, retryable) = {
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut latest = load_document(&path)?;
+        let item = latest
+            .segments
+            .iter_mut()
+            .find(|item| item.id == segment_id)
+            .ok_or(TranscriptionError::SegmentMissing(segment_id))?;
+        match result {
+            Ok(transcription) => {
+                item.detected_language = transcription.language;
+                item.error = None;
+                item.status = TranscriptSegmentStatus::Complete;
+                item.text = transcription.text;
+            }
+            Err(error) => {
+                item.error = Some(error.to_string());
+                item.status = TranscriptSegmentStatus::Failed;
+            }
         }
-        Err(error) => {
-            item.error = Some(error.to_string());
-            item.status = TranscriptSegmentStatus::Failed;
-        }
-    }
-    let resolved_snapshot = item.clone();
-    let retryable = latest
-        .segments
-        .iter()
-        .filter(|item| is_retryable(item))
-        .count();
-    let failed = latest
-        .segments
-        .iter()
-        .any(|item| item.status == TranscriptSegmentStatus::Failed);
-    latest.status = if retryable > 0 {
-        TranscriptDocumentStatus::Pending
-    } else if failed {
-        TranscriptDocumentStatus::Partial
-    } else {
-        TranscriptDocumentStatus::Complete
+        let resolved_snapshot = item.clone();
+        let retryable = latest
+            .segments
+            .iter()
+            .filter(|item| is_retryable(item))
+            .count();
+        let failed = latest
+            .segments
+            .iter()
+            .any(|item| item.status == TranscriptSegmentStatus::Failed);
+        latest.status = if retryable > 0 {
+            TranscriptDocumentStatus::Pending
+        } else if failed {
+            TranscriptDocumentStatus::Partial
+        } else {
+            TranscriptDocumentStatus::Complete
+        };
+        latest.updated_at = Utc::now();
+        save_document(&path, &latest)?;
+        (
+            latest.session_id,
+            latest.translation,
+            resolved_snapshot,
+            retryable,
+        )
     };
-    latest.updated_at = Utc::now();
-    save_document(&path, &latest)?;
-    inner.publish_segment(&latest.session_id, &resolved_snapshot);
+    inner.publish_segment(&session_id, &resolved_snapshot);
+    if resolved_snapshot.status == TranscriptSegmentStatus::Complete {
+        (inner.completion_observer)(
+            session_dir.to_path_buf(),
+            session_id,
+            translation_settings,
+            resolved_snapshot.clone(),
+        );
+    }
     inner.publish(|status| {
         status.pending_segments = retryable;
         if retryable == 0 {

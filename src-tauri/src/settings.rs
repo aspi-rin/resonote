@@ -103,6 +103,26 @@ pub struct TranscriptionSettings {
     pub vad: VadConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TranslationSettings {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub model: String,
+    pub target_language: String,
+}
+
+impl Default for TranslationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            endpoint: "http://127.0.0.1:8000/v1".to_owned(),
+            model: "Hy-MT2-1.8B".to_owned(),
+            target_language: "Chinese".to_owned(),
+        }
+    }
+}
+
 impl Default for TranscriptionSettings {
     fn default() -> Self {
         Self {
@@ -125,6 +145,7 @@ pub struct AppSettings {
     pub audio: AudioSettings,
     pub desktop: DesktopSettings,
     pub transcription: TranscriptionSettings,
+    pub translation: TranslationSettings,
 }
 
 impl AppSettings {
@@ -152,6 +173,26 @@ impl AppSettings {
         if !is_supported_model(&self.transcription.model_id) {
             return Err(SettingsError::Validation(
                 "transcription modelId is not supported".to_owned(),
+            ));
+        }
+        let endpoint = reqwest::Url::parse(self.translation.endpoint.trim()).map_err(|_| {
+            SettingsError::Validation(
+                "translation endpoint must be a valid http or https URL".to_owned(),
+            )
+        })?;
+        if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+            return Err(SettingsError::Validation(
+                "translation endpoint must be a valid http or https URL".to_owned(),
+            ));
+        }
+        if self.translation.model.trim().is_empty() {
+            return Err(SettingsError::Validation(
+                "translation model cannot be empty".to_owned(),
+            ));
+        }
+        if self.translation.target_language.trim().is_empty() {
+            return Err(SettingsError::Validation(
+                "translation targetLanguage cannot be empty".to_owned(),
             ));
         }
         self.transcription
@@ -243,6 +284,10 @@ mod tests {
         assert_eq!(settings.transcription.threads, 6);
         #[cfg(not(target_os = "macos"))]
         assert_eq!(settings.transcription.threads, 2);
+        assert!(settings.translation.enabled);
+        assert_eq!(settings.translation.endpoint, "http://127.0.0.1:8000/v1");
+        assert_eq!(settings.translation.model, "Hy-MT2-1.8B");
+        assert_eq!(settings.translation.target_language, "Chinese");
         settings.validate().unwrap();
     }
 
@@ -301,5 +346,27 @@ mod tests {
             store.snapshot().transcription.model_id,
             TranscriptionSettings::default().model_id
         );
+    }
+
+    #[test]
+    fn adds_default_translation_settings_to_older_configuration_files() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("translation");
+
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+
+        assert_eq!(settings.translation, TranslationSettings::default());
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_translation_settings() {
+        let mut settings = AppSettings::default();
+        settings.translation.endpoint = "localhost:8000/v1".to_owned();
+        assert!(settings.validate().is_err());
+
+        settings.translation.endpoint = "http://127.0.0.1:8000/v1".to_owned();
+        settings.translation.model.clear();
+        assert!(settings.validate().is_err());
     }
 }

@@ -7,6 +7,7 @@ Resonote is designed to be a lightweight, local-first voice recorder and transcr
 - **Rust-centric Core**: Recording, DSP, encoding, VAD, file I/O, and model management run entirely in Rust.
 - **Decoupled Frontend**: The Preact WebView does not handle raw PCM data; it only receives status updates at 10 Hz.
 - **Fail-safe Audio**: Main audio recording and file writes are decoupled from transcription. Transcription errors never disrupt recording.
+- **Fail-safe Translation**: Translation runs on its own persistent queue. Endpoint failures never block recording or ASR.
 - **Crash Recovery**: Audio streams and session metadata (`session.json`) are checkpointed every 5 seconds. Atomic file writes prevent corruption.
 
 ## Data Flow
@@ -23,8 +24,12 @@ flowchart LR
   VAD --> QUEUE["Transcription Queue\ntranscript.json"]
   QUEUE --> ASR["Local Qwen3-ASR\nsherpa-onnx"]
   ASR --> QUEUE
+  QUEUE --> TRANSLATE["Translation Queue\ntranslation.json"]
+  TRANSLATE --> LLM["OpenAI-compatible LLM\n/chat/completions"]
+  LLM --> TRANSLATE
   MIX -. "10 Hz Status" .-> UI
   QUEUE -. "Queue Events" .-> UI
+  TRANSLATE -. "Translation Events" .-> UI
 ```
 
 ## Threading & Lifecycle
@@ -32,6 +37,7 @@ flowchart LR
 - **Audio Callbacks**: Copy samples quickly to lock-free channels; no disk/model work in the callback thread.
 - **Recording Loop (`resonote-recording`)**: Aligns inputs, runs DSP, writes audio, and performs VAD.
 - **Transcription Service (`resonote-transcription`)**: Scans the persistent queue, processes segments sequentially, and manages ASR model lifetime.
+- **Translation Service (`resonote-translation`)**: Translates completed ASR segments on a separate worker with a 60-second request timeout and persistent retries.
 - **ASR Inference**: Runs synchronously on a worker thread. The ASR engine is released (via RAII) after a configurable idle timeout.
 - **UI WebView**: Manages UI state and settings. Closing the window hides the app to the system tray, while background services keep running.
 
@@ -45,6 +51,7 @@ flowchart LR
 - `vad.rs`: `sherpa-onnx` Silero VAD implementation.
 - `models.rs` & `asr.rs`: Model catalog, validation, download resume, and `sherpa-onnx` Qwen3-ASR recognition.
 - `transcription.rs`: Resumable queue management, ASR loading/unloading.
+- `translation.rs`: OpenAI-compatible client, translation queue, atomic persistence, and crash recovery.
 - `recording.rs`: Orchestration of real-time audio components.
 - `desktop.rs`: System tray, single-instance lock, and startup configuration.
 
@@ -52,6 +59,7 @@ flowchart LR
 
 - **`session.json`**: The source of truth for a recording session (duration, sample count, file structure). Strictly validated to prevent path traversal.
 - **`transcript.json`**: Manages segment states (`pending`, `processing`, `complete`, `failed`). Segments in the `processing` state during a crash revert to `pending` upon restart. Failed segments are retried up to 3 times.
+- **`translation.json`**: Stores the per-session endpoint/model/language snapshot and per-segment translations. Processing work returns to `pending` after a crash; failed requests retry up to 3 times.
 
 ## Resource Policy
 

@@ -13,7 +13,7 @@ use crate::{
     audio::{AudioBlockError, ResampleStreamError},
     capture::{CaptureError, CaptureEvent, CaptureSession, CaptureSource, start_capture},
     models::{ModelError, ModelManager},
-    settings::{AudioSettings, AudioSourceMode, TranscriptionSettings},
+    settings::{AudioSettings, AudioSourceMode, TranscriptionSettings, TranslationSettings},
     storage::{RecordingArchive, SessionManifest, StorageError, recover_interrupted_sessions},
     transcription::TranscriptionService,
     vad::VadError,
@@ -118,6 +118,7 @@ impl RecordingService {
         &self,
         settings: AudioSettings,
         transcription_settings: TranscriptionSettings,
+        translation_settings: TranslationSettings,
     ) -> Result<RecordingStatus, RecordingError> {
         let mut active = self
             .active
@@ -194,6 +195,7 @@ impl RecordingService {
             status,
             transcription,
             transcription_settings,
+            translation_settings,
             vad_model,
         };
         let worker = thread::Builder::new()
