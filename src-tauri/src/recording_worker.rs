@@ -8,7 +8,7 @@ use std::{
 use crate::{
     audio::{AudioBlock, StreamResampler, TARGET_SAMPLE_RATE, mix_mono, rms_db, waveform_bins},
     capture::{CaptureEvent, CaptureSource, CapturedAudio},
-    settings::{AudioSettings, AudioSourceMode, TranscriptionSettings, TranslationSettings},
+    settings::{AudioSettings, AudioSourceMode},
     storage::{RecordingArchive, SessionManifest},
     transcription::TranscriptionService,
     vad::{VadOutput, VoiceActivitySegmenter},
@@ -17,7 +17,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 use super::{
     CHECKPOINT_INTERVAL, MAX_BUFFERED_SECONDS, MIX_CHUNK_SAMPLES, RecordingError, RecordingPhase,
-    RecordingStatus, STATUS_INTERVAL, StatusObserver,
+    RecordingStatus, RecordingTranscriptionConfig, STATUS_INTERVAL, StatusObserver,
 };
 
 #[derive(Clone, Copy)]
@@ -97,8 +97,7 @@ pub(super) struct RecordingWorkerContext {
     pub(super) source: Arc<RwLock<AudioSourceMode>>,
     pub(super) status: Arc<RwLock<RecordingStatus>>,
     pub(super) transcription: Option<Arc<TranscriptionService>>,
-    pub(super) transcription_settings: TranscriptionSettings,
-    pub(super) translation_settings: TranslationSettings,
+    pub(super) transcription_config: Arc<RwLock<RecordingTranscriptionConfig>>,
     pub(super) vad_model: Option<PathBuf>,
 }
 
@@ -146,8 +145,7 @@ fn process_audio(
     let mut system = None;
     let mut output = OutputRouter::new(
         archive,
-        context.transcription_settings.clone(),
-        context.translation_settings.clone(),
+        context.transcription_config.clone(),
         context.transcription.clone(),
         context.status.clone(),
         context.vad_model.as_deref(),
@@ -402,20 +400,23 @@ pub(super) struct OutputRouter<'a> {
     session_id: String,
     pub(super) status: Arc<RwLock<RecordingStatus>>,
     pub(super) transcription: Option<Arc<TranscriptionService>>,
-    pub(super) transcription_settings: TranscriptionSettings,
-    pub(super) translation_settings: TranslationSettings,
+    pub(super) transcription_config: Arc<RwLock<RecordingTranscriptionConfig>>,
     vad: Option<VoiceActivitySegmenter>,
 }
 
 impl<'a> OutputRouter<'a> {
     pub(super) fn new(
         archive: &'a mut RecordingArchive,
-        transcription_settings: TranscriptionSettings,
-        translation_settings: TranslationSettings,
+        transcription_config: Arc<RwLock<RecordingTranscriptionConfig>>,
         transcription: Option<Arc<TranscriptionService>>,
         status: Arc<RwLock<RecordingStatus>>,
         vad_model: Option<&std::path::Path>,
     ) -> Result<Self, RecordingError> {
+        let transcription_settings = transcription_config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .transcription
+            .clone();
         let vad = vad_model
             .map(|path| {
                 VoiceActivitySegmenter::new(
@@ -431,8 +432,7 @@ impl<'a> OutputRouter<'a> {
             archive,
             status,
             transcription,
-            transcription_settings,
-            translation_settings,
+            transcription_config,
             vad,
         })
     }
@@ -474,12 +474,17 @@ impl<'a> OutputRouter<'a> {
             .vad_probability = output.latest_probability;
         for segment in output.segments {
             if let Some(transcription) = &self.transcription {
+                let config = self
+                    .transcription_config
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
                 if let Err(error) = transcription.enqueue(
                     &self.session_directory,
                     &self.session_id,
                     &segment,
-                    &self.transcription_settings,
-                    &self.translation_settings,
+                    &config.transcription,
+                    &config.translation,
                 ) {
                     self.report_transcription_error(error.to_string());
                 }

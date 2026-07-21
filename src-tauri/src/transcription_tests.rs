@@ -43,6 +43,47 @@ fn durably_enqueues_speech_without_an_installed_model() {
 }
 
 #[test]
+fn updates_languages_for_an_active_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = Arc::new(ModelManager::new(directory.path().join("models")).unwrap());
+    let service = TranscriptionService::new(manager);
+    let session = directory.path().join("session");
+    fs::create_dir_all(&session).unwrap();
+    let segment = SpeechSegment {
+        end_sample: 3_200,
+        peak_probability: 0.9,
+        samples: vec![0.25; 1_600],
+        start_sample: 1_600,
+    };
+    service
+        .enqueue(
+            &session,
+            "session-1",
+            &segment,
+            &TranscriptionSettings::default(),
+            &TranslationSettings::default(),
+        )
+        .unwrap();
+    let transcription = TranscriptionSettings {
+        language: "Japanese".to_owned(),
+        ..TranscriptionSettings::default()
+    };
+    let translation = TranslationSettings {
+        enabled: false,
+        target_language: "English".to_owned(),
+        ..TranslationSettings::default()
+    };
+
+    service
+        .update_session_languages(&session, "session-1", &transcription, &translation)
+        .unwrap();
+
+    let document = load_document(&session.join(DOCUMENT_NAME)).unwrap();
+    assert_eq!(document.forced_language, "Japanese");
+    assert_eq!(document.translation, translation);
+}
+
+#[test]
 fn notifies_segment_observer_when_speech_is_enqueued() {
     let directory = tempfile::tempdir().unwrap();
     let manager = Arc::new(ModelManager::new(directory.path().join("models")).unwrap());

@@ -11,6 +11,13 @@ use crate::{
 use claxon::FlacReader;
 use std::time::Instant;
 
+fn transcription_config() -> Arc<RwLock<RecordingTranscriptionConfig>> {
+    Arc::new(RwLock::new(RecordingTranscriptionConfig {
+        transcription: TranscriptionSettings::default(),
+        translation: TranslationSettings::default(),
+    }))
+}
+
 #[test]
 fn mixes_synthetic_microphone_and_system_audio() {
     let directory = tempfile::tempdir().unwrap();
@@ -51,8 +58,7 @@ fn mixes_synthetic_microphone_and_system_audio() {
             settings,
             status: status.clone(),
             transcription: None,
-            transcription_settings: TranscriptionSettings::default(),
-            translation_settings: TranslationSettings::default(),
+            transcription_config: transcription_config(),
             vad_model: None,
         },
     )
@@ -89,15 +95,8 @@ fn switches_audio_source_without_restarting_the_archive() {
     let mut active_source = AudioSourceMode::Microphone;
 
     {
-        let mut output = OutputRouter::new(
-            &mut archive,
-            TranscriptionSettings::default(),
-            TranslationSettings::default(),
-            None,
-            status,
-            None,
-        )
-        .unwrap();
+        let mut output =
+            OutputRouter::new(&mut archive, transcription_config(), None, status, None).unwrap();
         process_event(
             synthetic_audio(CaptureSource::Microphone, 0.25),
             &mut microphone,
@@ -198,8 +197,7 @@ fn archives_silence_without_vad_in_recording_only_test_service() {
     {
         let mut output = OutputRouter::new(
             &mut archive,
-            TranscriptionSettings::default(),
-            TranslationSettings::default(),
+            transcription_config(),
             None,
             status.clone(),
             None,

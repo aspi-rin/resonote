@@ -121,7 +121,10 @@ impl TranscriptionService {
         let document_guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = session_dir.join(DOCUMENT_NAME);
         let mut document = if path.exists() {
-            load_document(&path)?
+            let mut document = load_document(&path)?;
+            document.forced_language = settings.language.clone();
+            document.translation = translation_settings.clone();
+            document
         } else {
             TranscriptDocument {
                 forced_language: settings.language.clone(),
@@ -186,6 +189,29 @@ impl TranscriptionService {
         });
         self.inner.publish_segment(session_id, &item);
         Ok(item)
+    }
+
+    pub fn update_session_languages(
+        &self,
+        session_dir: &Path,
+        session_id: &str,
+        settings: &TranscriptionSettings,
+        translation_settings: &TranslationSettings,
+    ) -> Result<(), TranscriptionError> {
+        let path = session_dir.join(DOCUMENT_NAME);
+        if !path.exists() {
+            return Ok(());
+        }
+        let lock = self.inner.document_lock(session_dir);
+        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut document = load_document(&path)?;
+        if document.session_id != session_id {
+            return Err(TranscriptionError::SessionMismatch);
+        }
+        document.forced_language = settings.language.clone();
+        document.translation = translation_settings.clone();
+        document.updated_at = Utc::now();
+        save_document(&path, &document)
     }
 
     pub fn recover_root(&self, root: &Path) -> Result<usize, TranscriptionError> {

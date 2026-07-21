@@ -128,7 +128,11 @@ impl TranslationService {
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = session_dir.join(DOCUMENT_NAME);
         let mut document = if path.exists() {
-            load_document(&path)?
+            let mut document = load_document(&path)?;
+            document.endpoint = settings.endpoint.trim().to_owned();
+            document.model = settings.model.trim().to_owned();
+            document.target_language = settings.target_language.trim().to_owned();
+            document
         } else {
             TranslationDocument {
                 endpoint: settings.endpoint.trim().to_owned(),
@@ -583,6 +587,35 @@ mod tests {
             parse_translation_response(body),
             Err(TranslationError::EmptyResponse)
         ));
+    }
+
+    #[test]
+    fn queued_translations_use_the_latest_runtime_language() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = TranslationService::new(Arc::new(|_| {})).unwrap();
+        let session = directory.path().join("session");
+        fs::create_dir_all(&session).unwrap();
+        let initial = TranslationSettings {
+            endpoint: "http://127.0.0.1:9/v1".to_owned(),
+            target_language: "Chinese".to_owned(),
+            ..TranslationSettings::default()
+        };
+        service
+            .enqueue(&session, "session-1", 1, "hello", &initial)
+            .unwrap();
+        let updated = TranslationSettings {
+            model: "updated-model".to_owned(),
+            target_language: "Japanese".to_owned(),
+            ..initial
+        };
+
+        service
+            .enqueue(&session, "session-1", 2, "hello again", &updated)
+            .unwrap();
+
+        let document = load_document(&session.join(DOCUMENT_NAME)).unwrap();
+        assert_eq!(document.model, "updated-model");
+        assert_eq!(document.target_language, "Japanese");
     }
 
     #[test]
