@@ -1,4 +1,7 @@
-use std::{fs, sync::Arc};
+use std::{
+    fs,
+    sync::{Arc, Mutex},
+};
 
 use chrono::Utc;
 
@@ -36,6 +39,80 @@ fn durably_enqueues_speech_without_an_installed_model() {
         TranscriptSegmentStatus::Pending
     );
     assert!(session.join(&document.segments[0].audio_file).exists());
+}
+
+#[test]
+fn notifies_segment_observer_when_speech_is_enqueued() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = Arc::new(ModelManager::new(directory.path().join("models")).unwrap());
+    let updates: Arc<Mutex<Vec<TranscriptSegmentUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = updates.clone();
+    let service = TranscriptionService::with_observers(
+        manager,
+        Arc::new(|_| {}),
+        Arc::new(move |update| sink.lock().unwrap().push(update)),
+    );
+    let session = directory.path().join("session");
+    fs::create_dir_all(&session).unwrap();
+    let segment = SpeechSegment {
+        end_sample: 3_200,
+        peak_probability: 0.9,
+        samples: vec![0.25; 1_600],
+        start_sample: 1_600,
+    };
+
+    service
+        .enqueue(
+            &session,
+            "session-1",
+            &segment,
+            &TranscriptionSettings::default(),
+        )
+        .unwrap();
+
+    let captured = updates.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].session_id, "session-1");
+    assert_eq!(captured[0].segment.status, TranscriptSegmentStatus::Pending);
+    assert_eq!(captured[0].segment.start_ms, 100);
+    assert_eq!(captured[0].segment.end_ms, 200);
+}
+
+#[test]
+fn publishes_resolved_segment_snapshots_for_the_frontend() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = Arc::new(ModelManager::new(directory.path().join("models")).unwrap());
+    let updates: Arc<Mutex<Vec<TranscriptSegmentUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = updates.clone();
+    let service = TranscriptionService::with_observers(
+        manager,
+        Arc::new(|_| {}),
+        Arc::new(move |update| sink.lock().unwrap().push(update)),
+    );
+    let segment = TranscriptSegment {
+        attempts: 1,
+        audio_file: "speech/speech-000001.wav".to_owned(),
+        detected_language: "Chinese".to_owned(),
+        end_ms: 1_250,
+        error: None,
+        id: 1,
+        peak_probability: 0.95,
+        start_ms: 250,
+        status: TranscriptSegmentStatus::Complete,
+        text: "测试完成".to_owned(),
+    };
+
+    service.inner.publish_segment("session-1", &segment);
+
+    let captured = updates.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].session_id, "session-1");
+    assert_eq!(captured[0].segment, segment);
+    let payload = serde_json::to_value(&captured[0]).unwrap();
+    assert_eq!(payload["sessionId"], "session-1");
+    assert_eq!(payload["segment"]["startMs"], 250);
+    assert_eq!(payload["segment"]["status"], "complete");
+    assert_eq!(payload["segment"]["text"], "测试完成");
 }
 
 #[test]
