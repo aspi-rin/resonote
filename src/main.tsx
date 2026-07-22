@@ -445,16 +445,18 @@ function App() {
       </aside>
 
       <main class="main-panel">
-        <header class="topbar">
-          <div><p class="eyebrow">RESONOTE / {t(tab)}</p><h1>{t(tab)}</h1></div>
-          <span class={`phase-badge phase-${recording.phase}`}><i />{phaseLabel}</span>
-        </header>
+        <div class="main-content">
+          <header class="topbar">
+            <div><p class="eyebrow">RESONOTE / {t(tab)}</p><h1>{t(tab)}</h1></div>
+            <span class={`phase-badge phase-${recording.phase}`}><i />{phaseLabel}</span>
+          </header>
 
-        {error && <div class="error-banner" role="alert"><strong>{t("error")}</strong><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
+          {error && <div class="error-banner" role="alert"><strong>{t("error")}</strong><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
 
-        {tab === "record" && <RecordView t={t} settings={settings} recording={recording} transcription={transcription} model={model} liveSegments={liveTranscript.segments} liveTranslations={liveTranscript.translations} busy={busy} isActive={isActive} changeLanguages={changeRecordingLanguages} changeSource={changeAudioSource} start={startRecording} stop={stopRecording} />}
-        {tab === "history" && <HistoryView t={t} locale={locale} history={history} refresh={() => void refreshHistory()} open={(sessionId) => void invoke("open_recording_directory", { sessionId }).catch((reason) => setError(String(reason)))} remove={(sessionId) => void deleteRecording(sessionId)} />}
-        {tab === "settings" && <SettingsView t={t} settings={settings} models={models} busy={busy || isActive} modelTransitioning={modelTransitioning} saved={saved} update={update} save={() => void saveSettings()} model={model} selectModel={(modelId) => void selectModel(modelId)} installModel={installModel} cancelModel={() => void cancelModel()} chooseOutputDirectory={() => void chooseOutputDirectory()} />}
+          {tab === "record" && <RecordView t={t} settings={settings} recording={recording} transcription={transcription} model={model} liveSegments={liveTranscript.segments} liveTranslations={liveTranscript.translations} busy={busy} isActive={isActive} changeLanguages={changeRecordingLanguages} changeSource={changeAudioSource} start={startRecording} stop={stopRecording} />}
+          {tab === "history" && <HistoryView t={t} locale={locale} history={history} refresh={() => void refreshHistory()} open={(sessionId) => void invoke("open_recording_directory", { sessionId }).catch((reason) => setError(String(reason)))} remove={(sessionId) => void deleteRecording(sessionId)} />}
+          {tab === "settings" && <SettingsView t={t} settings={settings} models={models} busy={busy || isActive} modelTransitioning={modelTransitioning} saved={saved} update={update} save={() => void saveSettings()} model={model} selectModel={(modelId) => void selectModel(modelId)} installModel={installModel} cancelModel={() => void cancelModel()} chooseOutputDirectory={() => void chooseOutputDirectory()} />}
+        </div>
       </main>
     </div>
   );
