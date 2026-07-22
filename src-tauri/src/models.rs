@@ -40,6 +40,13 @@ pub enum ArtifactKind {
     VadModel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFamily {
+    FunAsrNano,
+    Qwen3Asr,
+    Whisper,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactSpec {
     pub file_name: String,
@@ -53,6 +60,7 @@ pub struct ArtifactSpec {
 pub struct ModelPackageSpec {
     pub artifacts: Vec<ArtifactSpec>,
     pub display_name: String,
+    pub family: ModelFamily,
     pub id: String,
     pub model_directory: &'static str,
     pub required_files: Vec<&'static str>,
@@ -90,12 +98,10 @@ pub struct ModelDownloadStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledModel {
-    pub conv_frontend: PathBuf,
-    pub decoder: PathBuf,
-    pub encoder: PathBuf,
+    pub directory: PathBuf,
+    pub family: ModelFamily,
     pub model_id: String,
     pub revision: String,
-    pub tokenizer: PathBuf,
     pub vad_model: PathBuf,
 }
 
@@ -197,12 +203,10 @@ impl ModelManager {
         let package = self.package_dir(&spec);
         let model = model_package::model_directory(&package, spec.model_directory);
         Ok(InstalledModel {
-            conv_frontend: model.join("conv_frontend.onnx"),
-            decoder: model.join("decoder.int8.onnx"),
-            encoder: model.join("encoder.int8.onnx"),
+            directory: model,
+            family: spec.family,
             model_id: spec.id,
             revision: spec.revision,
-            tokenizer: model.join("tokenizer"),
             vad_model: package.join("silero_vad.onnx"),
         })
     }

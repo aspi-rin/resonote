@@ -1,4 +1,6 @@
-use super::{ArtifactKind, ArtifactSpec, ModelCatalogEntry, ModelError, ModelPackageSpec};
+use super::{
+    ArtifactKind, ArtifactSpec, ModelCatalogEntry, ModelError, ModelFamily, ModelPackageSpec,
+};
 
 const SHERPA_RELEASE: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models";
 const QWEN_ONNX_REVISION: &str = "cb045ad80b8970c9d411d463e5b78991a566596c";
@@ -23,7 +25,12 @@ pub(super) fn model_spec(model_id: &str) -> Result<ModelPackageSpec, ModelError>
 }
 
 fn package_catalog() -> Vec<ModelPackageSpec> {
-    vec![qwen3_asr_0_6b_spec(), qwen3_asr_1_7b_spec()]
+    vec![
+        qwen3_asr_0_6b_spec(),
+        qwen3_asr_1_7b_spec(),
+        funasr_nano_int8_spec(),
+        whisper_large_v3_int8_spec(),
+    ]
 }
 
 fn qwen3_asr_0_6b_spec() -> ModelPackageSpec {
@@ -40,6 +47,7 @@ fn qwen3_asr_0_6b_spec() -> ModelPackageSpec {
             vad_artifact(),
         ],
         display_name: "Qwen3-ASR 0.6B INT8 · Multilingual".to_owned(),
+        family: ModelFamily::Qwen3Asr,
         id: "qwen3-asr-0.6b-int8".to_owned(),
         model_directory: "qwen3-asr",
         required_files: qwen_required_files(),
@@ -91,10 +99,68 @@ fn qwen3_asr_1_7b_spec() -> ModelPackageSpec {
             vad_artifact(),
         ],
         display_name: "Qwen3-ASR 1.7B INT8 · High accuracy".to_owned(),
+        family: ModelFamily::Qwen3Asr,
         id: "qwen3-asr-1.7b-int8".to_owned(),
         model_directory: "qwen3-asr",
         required_files: qwen_required_files(),
         revision: format!("sherpa-onnx-1.13.4-qwen3-{QWEN_ONNX_REVISION}"),
+    }
+}
+
+fn funasr_nano_int8_spec() -> ModelPackageSpec {
+    let file_name = "sherpa-onnx-funasr-nano-int8-2025-12-30.tar.bz2";
+    ModelPackageSpec {
+        artifacts: vec![
+            ArtifactSpec {
+                file_name: file_name.to_owned(),
+                kind: ArtifactKind::ModelArchive,
+                sha256: "eb43d7ccc2e86b243f6a03b7df361033dda66db9523d1a92bf6aca2b50c9476b"
+                    .to_owned(),
+                size: 841_730_611,
+                url: format!("{SHERPA_RELEASE}/{file_name}"),
+            },
+            vad_artifact(),
+        ],
+        display_name: "FunASR-Nano INT8 · Chinese, English, Japanese".to_owned(),
+        family: ModelFamily::FunAsrNano,
+        id: "funasr-nano-int8".to_owned(),
+        model_directory: "funasr-nano",
+        required_files: vec![
+            "encoder_adaptor.int8.onnx",
+            "llm.int8.onnx",
+            "embedding.int8.onnx",
+            "Qwen3-0.6B/tokenizer.json",
+            "Qwen3-0.6B/vocab.json",
+            "Qwen3-0.6B/merges.txt",
+        ],
+        revision: "sherpa-onnx-1.13.4-funasr-nano-2025-12-30".to_owned(),
+    }
+}
+
+fn whisper_large_v3_int8_spec() -> ModelPackageSpec {
+    let file_name = "sherpa-onnx-whisper-large-v3.tar.bz2";
+    ModelPackageSpec {
+        artifacts: vec![
+            ArtifactSpec {
+                file_name: file_name.to_owned(),
+                kind: ArtifactKind::ModelArchive,
+                sha256: "2d0e134b3b5fc4a0533baf24a0c9d473b629aa47f030af0a165a05f461df7a03"
+                    .to_owned(),
+                size: 1_068_482_488,
+                url: format!("{SHERPA_RELEASE}/{file_name}"),
+            },
+            vad_artifact(),
+        ],
+        display_name: "Whisper Large-v3 INT8 · Multilingual".to_owned(),
+        family: ModelFamily::Whisper,
+        id: "whisper-large-v3-int8".to_owned(),
+        model_directory: "whisper-large-v3",
+        required_files: vec![
+            "large-v3-encoder.int8.onnx",
+            "large-v3-decoder.int8.onnx",
+            "large-v3-tokens.txt",
+        ],
+        revision: "sherpa-onnx-1.13.4-whisper-large-v3-2024-07-13".to_owned(),
     }
 }
 

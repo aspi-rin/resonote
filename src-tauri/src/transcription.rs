@@ -38,7 +38,7 @@ pub use document::{
     TranscriptSegmentUpdate, TranscriptionPhase, TranscriptionStatus,
 };
 use document::{
-    collect_documents, is_retryable, load_document, qwen_language, sample_to_ms, save_document,
+    asr_language, collect_documents, is_retryable, load_document, sample_to_ms, save_document,
 };
 
 pub struct TranscriptionService {
@@ -311,6 +311,7 @@ impl TranscriptionInner {
 
 struct CachedRecognizer {
     idle_timeout: Duration,
+    language: Option<String>,
     last_used: Instant,
     model_id: String,
     recognizer: SherpaAsrRecognizer,
@@ -431,12 +432,11 @@ fn process_session(
         status.model_loaded = true;
         status.phase = TranscriptionPhase::Transcribing;
     });
-    let forced_language = qwen_language(&document.forced_language);
     let result = cached
         .as_mut()
         .expect("recognizer was initialized")
         .recognizer
-        .transcribe_wav(&audio_path, forced_language);
+        .transcribe_wav(&audio_path);
     if let Some(recognizer) = cached.as_mut() {
         recognizer.last_used = Instant::now();
     }
@@ -510,8 +510,11 @@ fn ensure_recognizer(
     document: &TranscriptDocument,
     cached: &mut Option<CachedRecognizer>,
 ) -> Result<(), TranscriptionError> {
+    let language = asr_language(&document.forced_language).map(str::to_owned);
     let reusable = cached.as_ref().is_some_and(|recognizer| {
-        recognizer.model_id == document.model_id && recognizer.threads == document.threads
+        recognizer.model_id == document.model_id
+            && recognizer.threads == document.threads
+            && recognizer.language == language
     });
     if reusable {
         return Ok(());
@@ -523,12 +526,17 @@ fn ensure_recognizer(
         status.model_loaded = false;
         status.phase = TranscriptionPhase::LoadingModel;
     });
-    let recognizer =
-        SherpaAsrRecognizer::load(&inner.manager, &document.model_id, document.threads)?;
+    let recognizer = SherpaAsrRecognizer::load(
+        &inner.manager,
+        &document.model_id,
+        document.threads,
+        language.as_deref(),
+    )?;
     *cached = Some(CachedRecognizer {
         idle_timeout: Duration::from_secs(
             u64::from(document.unload_after_idle_minutes).saturating_mul(60),
         ),
+        language,
         last_used: Instant::now(),
         model_id: document.model_id.clone(),
         recognizer,

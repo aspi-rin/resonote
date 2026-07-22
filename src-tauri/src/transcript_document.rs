@@ -13,7 +13,7 @@ use crate::{audio::TARGET_SAMPLE_RATE, settings::TranslationSettings};
 
 const MAX_ATTEMPTS: u32 = 3;
 
-pub(super) fn qwen_language(language: &str) -> Option<&str> {
+pub(super) fn asr_language(language: &str) -> Option<&str> {
     match language.trim() {
         "" | "auto" => None,
         "zh" | "zh-CN" | "Chinese" => Some("Chinese"),

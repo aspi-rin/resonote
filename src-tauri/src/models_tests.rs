@@ -147,7 +147,12 @@ fn catalog_uses_pinned_assets_for_every_model() {
             .iter()
             .map(|entry| entry.id.as_str())
             .collect::<Vec<_>>(),
-        [DEFAULT_MODEL_ID, "qwen3-asr-1.7b-int8"]
+        [
+            DEFAULT_MODEL_ID,
+            "qwen3-asr-1.7b-int8",
+            "funasr-nano-int8",
+            "whisper-large-v3-int8",
+        ]
     );
     for entry in catalog {
         let spec = model_spec(&entry.id).unwrap();
@@ -210,6 +215,7 @@ fn marker_validation_does_not_rehash_model_files() {
             url: "https://example.invalid/model.bin".to_owned(),
         }],
         display_name: "Test model".to_owned(),
+        family: ModelFamily::Qwen3Asr,
         id: "test-model".to_owned(),
         model_directory: "model",
         required_files: vec!["model.bin"],
@@ -247,6 +253,7 @@ fn marker_validation_still_rehashes_the_small_vad_file() {
             },
         ],
         display_name: "Test model".to_owned(),
+        family: ModelFamily::Qwen3Asr,
         id: "test-model".to_owned(),
         model_directory: "model",
         required_files: vec!["model.bin"],

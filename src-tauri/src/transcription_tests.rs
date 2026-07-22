@@ -231,7 +231,7 @@ fn deleting_a_session_removes_its_pending_queue_count() {
 
 #[test]
 fn maps_common_language_codes() {
-    assert_eq!(qwen_language("auto"), None);
-    assert_eq!(qwen_language("zh-CN"), Some("Chinese"));
-    assert_eq!(qwen_language("ja"), Some("Japanese"));
+    assert_eq!(asr_language("auto"), None);
+    assert_eq!(asr_language("zh-CN"), Some("Chinese"));
+    assert_eq!(asr_language("ja"), Some("Japanese"));
 }
