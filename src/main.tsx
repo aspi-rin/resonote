@@ -51,6 +51,8 @@ const isTauri = "__TAURI_INTERNALS__" in window;
 const FALLBACK_MODEL_CATALOG: ModelCatalogEntry[] = [
   { displayName: "Qwen3-ASR 0.6B INT8 · Multilingual", id: "qwen3-asr-0.6b-int8", totalBytes: 879_346_277 },
   { displayName: "Qwen3-ASR 1.7B INT8 · High accuracy", id: "qwen3-asr-1.7b-int8", totalBytes: 2_404_866_275 },
+  { displayName: "FunASR-Nano INT8 · Chinese, English, Japanese", id: "funasr-nano-int8", totalBytes: 842_374_465 },
+  { displayName: "Whisper Large-v3 INT8 · Multilingual", id: "whisper-large-v3-int8", totalBytes: 1_069_126_342 },
 ];
 
 function Icon({ name }: { name: IconName }) {
