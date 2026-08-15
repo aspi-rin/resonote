@@ -12,7 +12,7 @@ npm run verify
 git status --short
 ```
 
-`npm run verify` runs TypeScript validation, Vite production build, Rust formatting checks, Clippy, and unit tests.
+`npm run verify` runs TypeScript validation, Vite production build, Rust formatting checks, Clippy, Rust unit tests, and the frontend Vitest suite.
 
 ### Device-Dependent Tests
 The following tests require physical audio devices and are ignored by default. Run them manually:

@@ -1,8 +1,8 @@
 use std::{
-    fs,
+    fmt, fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::RwLock,
+    sync::{Arc, RwLock},
 };
 
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::{
     models::{DEFAULT_MODEL_ID, is_supported_model},
+    openai_compatible::{allows_bearer_auth, chat_completions_url},
     vad::VadConfig,
 };
 
@@ -103,9 +104,41 @@ pub struct TranscriptionSettings {
     pub vad: VadConfig,
 }
 
+/// Debug always renders `[REDACTED]`; only the private stored settings file
+/// ever serializes the value.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn trimmed(&self) -> &str {
+        self.0.trim()
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderAuthMode {
+    #[default]
+    None,
+    Bearer,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct TranslationSettings {
+    pub api_key: SecretString,
+    pub api_key_endpoint: String,
     pub enabled: bool,
     pub endpoint: String,
     pub model: String,
@@ -115,11 +148,82 @@ pub struct TranslationSettings {
 impl Default for TranslationSettings {
     fn default() -> Self {
         Self {
+            api_key: SecretString::default(),
+            api_key_endpoint: String::new(),
             enabled: true,
             endpoint: "http://127.0.0.1:8000/v1".to_owned(),
             model: "Hy-MT2-1.8B".to_owned(),
             target_language: "Chinese".to_owned(),
         }
+    }
+}
+
+impl TranslationSettings {
+    pub fn snapshot(&self) -> TranslationSnapshot {
+        TranslationSnapshot {
+            auth_mode: if self.credential_configured() {
+                ProviderAuthMode::Bearer
+            } else {
+                ProviderAuthMode::None
+            },
+            enabled: self.enabled,
+            endpoint: self.endpoint.trim().to_owned(),
+            model: self.model.trim().to_owned(),
+            target_language: self.target_language.trim().to_owned(),
+        }
+    }
+
+    fn credential_configured(&self) -> bool {
+        credential_configured(&self.api_key, &self.api_key_endpoint, &self.endpoint)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MeetingNotesSettings {
+    pub api_key: SecretString,
+    pub api_key_endpoint: String,
+    pub endpoint: String,
+    pub max_input_characters: u32,
+    pub model: String,
+    pub request_timeout_seconds: u32,
+}
+
+impl Default for MeetingNotesSettings {
+    fn default() -> Self {
+        Self {
+            api_key: SecretString::default(),
+            api_key_endpoint: String::new(),
+            endpoint: "http://127.0.0.1:8000/v1".to_owned(),
+            max_input_characters: 48_000,
+            model: String::new(),
+            request_timeout_seconds: 180,
+        }
+    }
+}
+
+impl MeetingNotesSettings {
+    pub fn credential_configured(&self) -> bool {
+        credential_configured(&self.api_key, &self.api_key_endpoint, &self.endpoint)
+    }
+}
+
+/// Secret-free projection of the translation settings, frozen into session
+/// documents so a recording keeps using the provider it started with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationSnapshot {
+    #[serde(default)]
+    pub auth_mode: ProviderAuthMode,
+    pub enabled: bool,
+    pub endpoint: String,
+    pub model: String,
+    pub target_language: String,
+}
+
+impl Default for TranslationSnapshot {
+    fn default() -> Self {
+        TranslationSettings::default().snapshot()
     }
 }
 
@@ -139,16 +243,167 @@ const fn default_transcription_threads() -> u16 {
     if cfg!(target_os = "macos") { 6 } else { 2 }
 }
 
+/// Private stored settings: the only place API keys live.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {
     pub audio: AudioSettings,
     pub desktop: DesktopSettings,
+    pub meeting_notes: MeetingNotesSettings,
     pub transcription: TranscriptionSettings,
     pub translation: TranslationSettings,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSettingsView {
+    pub api_key_configured: bool,
+    pub endpoint: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationSettingsView {
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub provider: ProviderSettingsView,
+    pub target_language: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingNotesSettingsView {
+    pub max_input_characters: u32,
+    #[serde(flatten)]
+    pub provider: ProviderSettingsView,
+    pub request_timeout_seconds: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSettingsView {
+    pub audio: AudioSettings,
+    pub desktop: DesktopSettings,
+    pub meeting_notes: MeetingNotesSettingsView,
+    pub transcription: TranscriptionSettings,
+    pub translation: TranslationSettingsView,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationSettingsWithoutSecrets {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub model: String,
+    pub target_language: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingNotesSettingsWithoutSecrets {
+    pub endpoint: String,
+    pub max_input_characters: u32,
+    pub model: String,
+    pub request_timeout_seconds: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSettingsWithoutSecrets {
+    pub audio: AudioSettings,
+    pub desktop: DesktopSettings,
+    pub meeting_notes: MeetingNotesSettingsWithoutSecrets,
+    pub transcription: TranscriptionSettings,
+    pub translation: TranslationSettingsWithoutSecrets,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "action")]
+pub enum SecretUpdate {
+    #[default]
+    Keep,
+    Set {
+        value: String,
+    },
+    Clear,
+}
+
+impl fmt::Debug for SecretUpdate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Keep => "Keep",
+            Self::Set { .. } => "Set([REDACTED])",
+            Self::Clear => "Clear",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SettingsSecretUpdates {
+    pub meeting_notes_api_key: SecretUpdate,
+    pub translation_api_key: SecretUpdate,
+}
+
 impl AppSettings {
+    pub fn view(&self) -> AppSettingsView {
+        AppSettingsView {
+            audio: self.audio.clone(),
+            desktop: self.desktop.clone(),
+            meeting_notes: MeetingNotesSettingsView {
+                max_input_characters: self.meeting_notes.max_input_characters,
+                provider: ProviderSettingsView {
+                    api_key_configured: self.meeting_notes.credential_configured(),
+                    endpoint: self.meeting_notes.endpoint.clone(),
+                    model: self.meeting_notes.model.clone(),
+                },
+                request_timeout_seconds: self.meeting_notes.request_timeout_seconds,
+            },
+            transcription: self.transcription.clone(),
+            translation: TranslationSettingsView {
+                enabled: self.translation.enabled,
+                provider: ProviderSettingsView {
+                    api_key_configured: self.translation.credential_configured(),
+                    endpoint: self.translation.endpoint.clone(),
+                    model: self.translation.model.clone(),
+                },
+                target_language: self.translation.target_language.clone(),
+            },
+        }
+    }
+
+    fn merge(
+        mut self,
+        incoming: AppSettingsWithoutSecrets,
+        secrets: SettingsSecretUpdates,
+    ) -> Self {
+        self.audio = incoming.audio;
+        self.desktop = incoming.desktop;
+        self.transcription = incoming.transcription;
+        self.meeting_notes.endpoint = incoming.meeting_notes.endpoint.trim().to_owned();
+        self.meeting_notes.max_input_characters = incoming.meeting_notes.max_input_characters;
+        self.meeting_notes.model = incoming.meeting_notes.model.trim().to_owned();
+        self.meeting_notes.request_timeout_seconds = incoming.meeting_notes.request_timeout_seconds;
+        self.translation.enabled = incoming.translation.enabled;
+        self.translation.endpoint = incoming.translation.endpoint.trim().to_owned();
+        self.translation.model = incoming.translation.model.trim().to_owned();
+        self.translation.target_language = incoming.translation.target_language.trim().to_owned();
+        apply_secret(
+            &mut self.meeting_notes.api_key,
+            &mut self.meeting_notes.api_key_endpoint,
+            secrets.meeting_notes_api_key,
+            &self.meeting_notes.endpoint,
+        );
+        apply_secret(
+            &mut self.translation.api_key,
+            &mut self.translation.api_key_endpoint,
+            secrets.translation_api_key,
+            &self.translation.endpoint,
+        );
+        self
+    }
+
     pub fn validate(&self) -> Result<(), SettingsError> {
         if !(1..=24 * 60).contains(&self.audio.segment_minutes) {
             return Err(SettingsError::Validation(
@@ -175,16 +430,12 @@ impl AppSettings {
                 "transcription modelId is not supported".to_owned(),
             ));
         }
-        let endpoint = reqwest::Url::parse(self.translation.endpoint.trim()).map_err(|_| {
-            SettingsError::Validation(
-                "translation endpoint must be a valid http or https URL".to_owned(),
-            )
-        })?;
-        if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
-            return Err(SettingsError::Validation(
-                "translation endpoint must be a valid http or https URL".to_owned(),
-            ));
-        }
+        validate_provider(
+            "translation",
+            &self.translation.endpoint,
+            &self.translation.api_key,
+            &self.translation.api_key_endpoint,
+        )?;
         if self.translation.model.trim().is_empty() {
             return Err(SettingsError::Validation(
                 "translation model cannot be empty".to_owned(),
@@ -193,6 +444,22 @@ impl AppSettings {
         if self.translation.target_language.trim().is_empty() {
             return Err(SettingsError::Validation(
                 "translation targetLanguage cannot be empty".to_owned(),
+            ));
+        }
+        validate_provider(
+            "meetingNotes",
+            &self.meeting_notes.endpoint,
+            &self.meeting_notes.api_key,
+            &self.meeting_notes.api_key_endpoint,
+        )?;
+        if !(8_000..=200_000).contains(&self.meeting_notes.max_input_characters) {
+            return Err(SettingsError::Validation(
+                "meetingNotes maxInputCharacters must be between 8000 and 200000".to_owned(),
+            ));
+        }
+        if !(30..=900).contains(&self.meeting_notes.request_timeout_seconds) {
+            return Err(SettingsError::Validation(
+                "meetingNotes requestTimeoutSeconds must be between 30 and 900".to_owned(),
             ));
         }
         self.transcription
@@ -216,7 +483,7 @@ pub enum SettingsError {
 }
 
 pub struct SettingsStore {
-    current: RwLock<AppSettings>,
+    current: Arc<RwLock<AppSettings>>,
     path: PathBuf,
 }
 
@@ -229,7 +496,7 @@ impl SettingsStore {
         }
         current.validate()?;
         Ok(Self {
-            current: RwLock::new(current),
+            current: Arc::new(RwLock::new(current)),
             path,
         })
     }
@@ -241,15 +508,136 @@ impl SettingsStore {
             .clone()
     }
 
-    pub fn save(&self, settings: AppSettings) -> Result<AppSettings, SettingsError> {
-        settings.validate()?;
-        save_settings_atomic(&self.path, &settings)?;
+    pub fn view(&self) -> AppSettingsView {
+        self.current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .view()
+    }
+
+    pub fn credentials(&self) -> ProviderCredentials {
+        ProviderCredentials {
+            settings: self.current.clone(),
+        }
+    }
+
+    pub fn save(
+        &self,
+        settings: AppSettingsWithoutSecrets,
+        secrets: SettingsSecretUpdates,
+    ) -> Result<AppSettingsView, SettingsError> {
+        let merged = self.snapshot().merge(settings, secrets);
+        merged.validate()?;
+        save_settings_atomic(&self.path, &merged)?;
+        let view = merged.view();
         *self
             .current
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = settings.clone();
-        Ok(settings)
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = merged;
+        Ok(view)
     }
+}
+
+/// Read-only handle on the stored credentials, resolved per request so a key
+/// rotated for the same endpoint reaches queued work.
+#[derive(Clone, Default)]
+pub struct ProviderCredentials {
+    settings: Arc<RwLock<AppSettings>>,
+}
+
+impl ProviderCredentials {
+    /// Read under the same lock as the credentials, so a job freezes a
+    /// consistent provider and key pair.
+    pub fn meeting_notes(&self) -> MeetingNotesSettings {
+        self.settings
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .meeting_notes
+            .clone()
+    }
+
+    pub fn meeting_notes_key(&self, endpoint: &str) -> Option<SecretString> {
+        let settings = self
+            .settings
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        credential_configured(
+            &settings.meeting_notes.api_key,
+            &settings.meeting_notes.api_key_endpoint,
+            endpoint,
+        )
+        .then(|| settings.meeting_notes.api_key.clone())
+    }
+
+    pub fn translation_key(&self, endpoint: &str) -> Option<SecretString> {
+        let settings = self
+            .settings
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        credential_configured(
+            &settings.translation.api_key,
+            &settings.translation.api_key_endpoint,
+            endpoint,
+        )
+        .then(|| settings.translation.api_key.clone())
+    }
+}
+
+fn apply_secret(
+    key: &mut SecretString,
+    binding: &mut String,
+    update: SecretUpdate,
+    endpoint: &str,
+) {
+    match update {
+        SecretUpdate::Keep => {}
+        SecretUpdate::Clear => {
+            *key = SecretString::default();
+            binding.clear();
+        }
+        SecretUpdate::Set { value } => {
+            if value.trim().is_empty() {
+                *key = SecretString::default();
+                binding.clear();
+            } else {
+                *key = SecretString::new(value);
+                *binding = normalized_endpoint(endpoint).unwrap_or_default();
+            }
+        }
+    }
+}
+
+fn credential_configured(key: &SecretString, binding: &str, endpoint: &str) -> bool {
+    !key.trimmed().is_empty()
+        && !binding.is_empty()
+        && normalized_endpoint(endpoint).is_some_and(|normalized| normalized == binding)
+}
+
+fn normalized_endpoint(endpoint: &str) -> Option<String> {
+    chat_completions_url(endpoint)
+        .ok()
+        .map(|url| url.to_string())
+}
+
+/// A key bound to another endpoint is never sent here, so only a credential
+/// bound to this endpoint blocks a plaintext remote host.
+fn validate_provider(
+    name: &str,
+    endpoint: &str,
+    api_key: &SecretString,
+    api_key_endpoint: &str,
+) -> Result<(), SettingsError> {
+    let url = chat_completions_url(endpoint).map_err(|_| {
+        SettingsError::Validation(format!(
+            "{name} endpoint must be a valid http or https URL without embedded credentials"
+        ))
+    })?;
+    if credential_configured(api_key, api_key_endpoint, endpoint) && !allows_bearer_auth(&url) {
+        return Err(SettingsError::Validation(format!(
+            "{name} endpoint must use https or a loopback host to store an API key"
+        )));
+    }
+    Ok(())
 }
 
 fn load_settings(path: &Path) -> Result<AppSettings, SettingsError> {
@@ -268,12 +656,55 @@ fn save_settings_atomic(path: &Path, settings: &AppSettings) -> Result<(), Setti
     temporary.write_all(b"\n")?;
     temporary.as_file().sync_all()?;
     temporary.persist(path)?;
+    restrict_to_current_user(path)?;
+    Ok(())
+}
+
+/// Windows inherits the current-user ACL of the app config directory.
+#[cfg(unix)]
+fn restrict_to_current_user(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_to_current_user(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn without_secrets(settings: &AppSettings) -> AppSettingsWithoutSecrets {
+        AppSettingsWithoutSecrets {
+            audio: settings.audio.clone(),
+            desktop: settings.desktop.clone(),
+            meeting_notes: MeetingNotesSettingsWithoutSecrets {
+                endpoint: settings.meeting_notes.endpoint.clone(),
+                max_input_characters: settings.meeting_notes.max_input_characters,
+                model: settings.meeting_notes.model.clone(),
+                request_timeout_seconds: settings.meeting_notes.request_timeout_seconds,
+            },
+            transcription: settings.transcription.clone(),
+            translation: TranslationSettingsWithoutSecrets {
+                enabled: settings.translation.enabled,
+                endpoint: settings.translation.endpoint.clone(),
+                model: settings.translation.model.clone(),
+                target_language: settings.translation.target_language.clone(),
+            },
+        }
+    }
+
+    fn set_key(value: &str) -> SettingsSecretUpdates {
+        SettingsSecretUpdates {
+            translation_api_key: SecretUpdate::Set {
+                value: value.to_owned(),
+            },
+            ..SettingsSecretUpdates::default()
+        }
+    }
 
     #[test]
     fn defaults_to_mixed_audio_with_transcription() {
@@ -288,6 +719,10 @@ mod tests {
         assert_eq!(settings.translation.endpoint, "http://127.0.0.1:8000/v1");
         assert_eq!(settings.translation.model, "Hy-MT2-1.8B");
         assert_eq!(settings.translation.target_language, "Chinese");
+        assert_eq!(settings.meeting_notes.endpoint, "http://127.0.0.1:8000/v1");
+        assert!(settings.meeting_notes.model.is_empty());
+        assert_eq!(settings.meeting_notes.max_input_characters, 48_000);
+        assert_eq!(settings.meeting_notes.request_timeout_seconds, 180);
         settings.validate().unwrap();
     }
 
@@ -307,14 +742,24 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
         let store = SettingsStore::open(path.clone()).unwrap();
-        let mut settings = store.snapshot();
-        settings.audio.segment_minutes = 30;
-        settings.audio.source = AudioSourceMode::System;
+        let mut incoming = without_secrets(&store.snapshot());
+        incoming.audio.segment_minutes = 30;
+        incoming.audio.source = AudioSourceMode::System;
+        incoming.meeting_notes.model = "  notes-model  ".to_owned();
+        incoming.translation.endpoint = " http://127.0.0.1:9000/v1 ".to_owned();
 
-        store.save(settings.clone()).unwrap();
+        let saved = store
+            .save(incoming, SettingsSecretUpdates::default())
+            .unwrap();
         let reopened = SettingsStore::open(path).unwrap();
 
-        assert_eq!(reopened.snapshot(), settings);
+        assert_eq!(saved.audio.segment_minutes, 30);
+        assert_eq!(saved.meeting_notes.provider.model, "notes-model");
+        assert_eq!(
+            saved.translation.provider.endpoint,
+            "http://127.0.0.1:9000/v1"
+        );
+        assert_eq!(reopened.view(), saved);
     }
 
     #[test]
@@ -368,5 +813,266 @@ mod tests {
         settings.translation.endpoint = "http://127.0.0.1:8000/v1".to_owned();
         settings.translation.model.clear();
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn loads_older_settings_without_secrets_or_meeting_notes() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        let root = value.as_object_mut().unwrap();
+        root.remove("meetingNotes");
+        let translation = root
+            .get_mut("translation")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        translation.remove("apiKey");
+        translation.remove("apiKeyEndpoint");
+        translation.insert("enabled".to_owned(), false.into());
+        translation.insert("endpoint".to_owned(), "https://provider.example/v1".into());
+        translation.insert("model".to_owned(), "legacy-model".into());
+        translation.insert("targetLanguage".to_owned(), "Japanese".into());
+
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+
+        assert!(!settings.translation.enabled);
+        assert_eq!(settings.translation.endpoint, "https://provider.example/v1");
+        assert_eq!(settings.translation.model, "legacy-model");
+        assert_eq!(settings.translation.target_language, "Japanese");
+        assert_eq!(settings.translation.api_key, SecretString::default());
+        assert!(settings.translation.api_key_endpoint.is_empty());
+        assert_eq!(settings.meeting_notes, MeetingNotesSettings::default());
+        settings.validate().unwrap();
+        let view = serde_json::to_value(settings.view()).unwrap();
+        assert_eq!(view["translation"]["apiKeyConfigured"], false);
+        assert_eq!(view["meetingNotes"]["apiKeyConfigured"], false);
+        assert_eq!(view["meetingNotes"]["maxInputCharacters"], 48_000);
+        assert!(view["translation"].get("apiKey").is_none());
+    }
+
+    #[test]
+    fn accepts_the_frontend_save_payload() {
+        let mut value = serde_json::to_value(AppSettings::default().view()).unwrap();
+        for provider in ["meetingNotes", "translation"] {
+            value
+                .get_mut(provider)
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap()
+                .remove("apiKeyConfigured");
+        }
+        let updates: SettingsSecretUpdates = serde_json::from_str(
+            r#"{"meetingNotesApiKey":{"action":"clear"},"translationApiKey":{"action":"set","value":"secret"}}"#,
+        )
+        .unwrap();
+
+        let incoming: AppSettingsWithoutSecrets = serde_json::from_value(value).unwrap();
+
+        assert_eq!(incoming.translation.model, "Hy-MT2-1.8B");
+        assert_eq!(incoming.meeting_notes.max_input_characters, 48_000);
+        assert!(matches!(updates.meeting_notes_api_key, SecretUpdate::Clear));
+        assert!(matches!(
+            updates.translation_api_key,
+            SecretUpdate::Set { .. }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<SecretUpdate>(r#"{"action":"keep"}"#).unwrap(),
+            SecretUpdate::Keep
+        ));
+    }
+
+    #[test]
+    fn settings_view_reports_a_configured_key_without_exposing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let store = SettingsStore::open(path.clone()).unwrap();
+
+        let view = store
+            .save(
+                without_secrets(&AppSettings::default()),
+                set_key("top-secret-key"),
+            )
+            .unwrap();
+
+        assert!(view.translation.provider.api_key_configured);
+        assert!(!view.meeting_notes.provider.api_key_configured);
+        let serialized = serde_json::to_string(&view).unwrap();
+        assert!(!serialized.contains("top-secret-key"));
+        assert!(serialized.contains("\"apiKeyConfigured\":true"));
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("top-secret-key")
+        );
+    }
+
+    #[test]
+    fn keeps_an_existing_key_bound_to_its_previous_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::open(directory.path().join("settings.json")).unwrap();
+        let credentials = store.credentials();
+        let mut incoming = without_secrets(&AppSettings::default());
+        incoming.translation.endpoint = "https://first.example/v1".to_owned();
+        let view = store
+            .save(incoming.clone(), set_key("  first-key  "))
+            .unwrap();
+        assert!(view.translation.provider.api_key_configured);
+        assert_eq!(
+            credentials
+                .translation_key("https://first.example/v1")
+                .unwrap()
+                .trimmed(),
+            "first-key"
+        );
+
+        incoming.translation.endpoint = "https://second.example/v1".to_owned();
+        let view = store
+            .save(incoming.clone(), SettingsSecretUpdates::default())
+            .unwrap();
+
+        assert!(!view.translation.provider.api_key_configured);
+        assert!(
+            credentials
+                .translation_key("https://second.example/v1")
+                .is_none()
+        );
+        assert_eq!(
+            store.snapshot().translation.snapshot().auth_mode,
+            ProviderAuthMode::None
+        );
+
+        let view = store.save(incoming, set_key("second-key")).unwrap();
+
+        assert!(view.translation.provider.api_key_configured);
+        assert_eq!(
+            credentials
+                .translation_key("https://second.example/v1")
+                .unwrap()
+                .trimmed(),
+            "second-key"
+        );
+        assert!(
+            credentials
+                .translation_key("https://first.example/v1")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn clearing_a_secret_drops_the_key_and_its_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::open(directory.path().join("settings.json")).unwrap();
+        let incoming = without_secrets(&AppSettings::default());
+        store.save(incoming.clone(), set_key("secret")).unwrap();
+
+        let view = store
+            .save(
+                incoming,
+                SettingsSecretUpdates {
+                    translation_api_key: SecretUpdate::Clear,
+                    ..SettingsSecretUpdates::default()
+                },
+            )
+            .unwrap();
+
+        assert!(!view.translation.provider.api_key_configured);
+        let stored = store.snapshot();
+        assert_eq!(stored.translation.api_key, SecretString::default());
+        assert!(stored.translation.api_key_endpoint.is_empty());
+    }
+
+    #[test]
+    fn redacts_secrets_in_debug_output_and_snapshots() {
+        let mut settings = AppSettings::default();
+        settings.translation.api_key = SecretString::new("top-secret-key".to_owned());
+        settings.translation.api_key_endpoint =
+            normalized_endpoint(&settings.translation.endpoint).unwrap();
+
+        let snapshot = settings.translation.snapshot();
+
+        assert_eq!(snapshot.auth_mode, ProviderAuthMode::Bearer);
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(!serialized.contains("top-secret-key"));
+        assert!(serialized.contains("\"authMode\":\"bearer\""));
+        assert_eq!(format!("{:?}", settings.translation.api_key), "[REDACTED]");
+        assert!(!format!("{settings:?}").contains("top-secret-key"));
+        assert!(
+            !format!(
+                "{:?}",
+                SecretUpdate::Set {
+                    value: "top-secret-key".to_owned()
+                }
+            )
+            .contains("top-secret-key")
+        );
+    }
+
+    #[test]
+    fn rejects_endpoints_with_userinfo() {
+        let mut settings = AppSettings::default();
+        settings.translation.endpoint = "http://user:password@example.com/v1".to_owned();
+        assert!(settings.validate().is_err());
+
+        let mut settings = AppSettings::default();
+        settings.meeting_notes.endpoint = "http://user@example.com/v1".to_owned();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn refuses_to_bind_a_key_to_a_remote_plaintext_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::open(directory.path().join("settings.json")).unwrap();
+        let mut incoming = without_secrets(&AppSettings::default());
+        incoming.translation.endpoint = "http://provider.example/v1".to_owned();
+
+        store
+            .save(incoming.clone(), SettingsSecretUpdates::default())
+            .unwrap();
+        assert!(store.save(incoming.clone(), set_key("secret")).is_err());
+
+        incoming.translation.endpoint = "https://provider.example/v1".to_owned();
+        store.save(incoming.clone(), set_key("secret")).unwrap();
+        incoming.translation.endpoint = "http://provider.example/v1".to_owned();
+        let view = store
+            .save(incoming, SettingsSecretUpdates::default())
+            .unwrap();
+
+        assert!(!view.translation.provider.api_key_configured);
+    }
+
+    #[test]
+    fn accepts_an_empty_meeting_notes_model_and_range_checks_advanced_values() {
+        let mut settings = AppSettings::default();
+        assert!(settings.meeting_notes.model.is_empty());
+        settings.validate().unwrap();
+
+        for characters in [7_999, 200_001] {
+            settings.meeting_notes.max_input_characters = characters;
+            assert!(settings.validate().is_err());
+        }
+        settings.meeting_notes.max_input_characters = 8_000;
+        for seconds in [29, 901] {
+            settings.meeting_notes.request_timeout_seconds = seconds;
+            assert!(settings.validate().is_err());
+        }
+        settings.meeting_notes.request_timeout_seconds = 900;
+        settings.validate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restricts_the_settings_file_to_the_current_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let store = SettingsStore::open(path.clone()).unwrap();
+
+        store
+            .save(
+                without_secrets(&AppSettings::default()),
+                set_key("top-secret-key"),
+            )
+            .unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
