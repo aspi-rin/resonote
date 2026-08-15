@@ -6,16 +6,54 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { resolveLanguage, translator, type TranslationKey } from "./i18n";
 import packageMetadata from "../package.json";
 import {
+  Icon,
+  NumberField,
+  RangeField,
+  SelectField,
+  SettingsSection,
+  TextField,
+  Toggle,
+  formatBytes,
+  formatDuration,
+  isTauri,
+  type IconName,
+} from "./ui";
+import {
+  GlobalContextSection,
+  MeetingNotesChips,
+  MeetingNotesDetail,
+  MeetingNotesProviderSection,
+  ApiKeyField,
+  EndpointWarning,
+  analysisStatusFromEvent,
+  analysisStatusFromView,
+  describeError,
+  isNewerAnalysisStatus,
+  parseMeetingNotesError,
+  secretBlocksSave,
+  type AnalysisStatus,
+} from "./meeting_notes_ui";
+import {
   DEFAULT_MODEL_STATUS,
   DEFAULT_RECORDING_STATUS,
   DEFAULT_SETTINGS,
   DEFAULT_TRANSCRIPTION_STATUS,
+  EMPTY_GLOBAL_CONTEXT,
   type AppSettings,
+  type AppSettingsWithoutSecrets,
   type AudioSourceMode,
+  type GenerateMode,
+  type GlobalContextContent,
+  type GlobalContextDocument,
   type HistoryEntry,
+  type MeetingContextContent,
+  type MeetingNotesStatusEvent,
   type ModelCatalogEntry,
   type ModelDownloadStatus,
   type RecordingStatus,
+  type SecretUpdate,
+  type SessionAnalysisView,
+  type SettingsSecretUpdates,
   type TranscriptDocument,
   type TranscriptSegment,
   type TranscriptSegmentUpdate,
@@ -23,23 +61,11 @@ import {
   type TranslationDocument,
   type TranslationSegment,
   type TranslationSegmentUpdate,
+  type VersionedMeetingContext,
 } from "./types";
 import "./styles.css";
 
 type Tab = "record" | "history" | "settings";
-type IconName =
-  | "archive"
-  | "check"
-  | "download"
-  | "folder"
-  | "gear"
-  | "history"
-  | "mic"
-  | "refresh"
-  | "shield"
-  | "text"
-  | "trash"
-  | "wave";
 
 interface LiveTranscript {
   segments: TranscriptSegment[];
@@ -47,7 +73,7 @@ interface LiveTranscript {
   translations: TranslationSegment[];
 }
 
-const isTauri = "__TAURI_INTERNALS__" in window;
+const EMPTY_GLOBAL_CONTEXT_DOCUMENT: GlobalContextDocument = { content: EMPTY_GLOBAL_CONTEXT, revision: 0, schemaVersion: 1, updatedAt: "" };
 const FALLBACK_MODEL_CATALOG: ModelCatalogEntry[] = [
   { displayName: "Qwen3-ASR 0.6B INT8 · Multilingual", id: "qwen3-asr-0.6b-int8", totalBytes: 879_346_277 },
   { displayName: "Qwen3-ASR 1.7B INT8 · High accuracy", id: "qwen3-asr-1.7b-int8", totalBytes: 2_404_866_275 },
@@ -55,25 +81,30 @@ const FALLBACK_MODEL_CATALOG: ModelCatalogEntry[] = [
   { displayName: "Whisper Large-v3 INT8 · Multilingual", id: "whisper-large-v3-int8", totalBytes: 1_069_126_342 },
 ];
 
-function Icon({ name }: { name: IconName }) {
-  const paths: Record<IconName, preact.JSX.Element> = {
-    archive: <><path d="M4 7h16v13H4z"/><path d="M3 3h18v4H3zm6 8h6"/></>,
-    check: <path d="m5 12 4 4L19 6"/>,
-    download: <><path d="M12 3v12m-5-5 5 5 5-5"/><path d="M5 20h14"/></>,
-    folder: <path d="M3 6h7l2 2h9v11H3z"/>,
-    gear: <><circle cx="12" cy="12" r="3"/><path d="M19 13.5v-3l-2-.7-.7-1.7.9-1.9-2.1-2.1-1.9.9-1.7-.7L10.5 2h-3l-.7 2-1.7.7-1.9-.9-2.1 2.1.9 1.9-.7 1.7-2 .7v3l2 .7.7 1.7-.9 1.9 2.1 2.1 1.9-.9 1.7.7.7 2h3l.7-2 1.7-.7 1.9.9 2.1-2.1-.9-1.9.7-1.7z"/></>,
-    history: <><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5m4-2v6l4 2"/></>,
-    mic: <><rect x="8" y="3" width="8" height="12" rx="4"/><path d="M5 11a7 7 0 0 0 14 0m-7 7v3m-4 0h8"/></>,
-    refresh: <><path d="M20 7v5h-5"/><path d="M19 12a7 7 0 1 0-2 5"/></>,
-    shield: <path d="M12 2 4 5v6c0 5 3.4 8.6 8 11 4.6-2.4 8-6 8-11V5z"/>,
-    text: <path d="M4 6h16M4 11h16M4 16h10"/>,
-    trash: <><path d="M4 7h16m-10 4v6m4-6v6M9 7l1-3h4l1 3m3 0-1 14H7L6 7"/></>,
-    wave: <path d="M3 12h2l2-7 3 14 3-11 2 8 2-4h4"/>,
+const KEEP_SECRETS: SettingsSecretUpdates = { meetingNotesApiKey: { action: "keep" }, translationApiKey: { action: "keep" } };
+
+function saveSettingsPayload(settings: AppSettings, secrets: SettingsSecretUpdates = KEEP_SECRETS) {
+  const payload: AppSettingsWithoutSecrets = {
+    audio: settings.audio,
+    desktop: settings.desktop,
+    meetingNotes: {
+      endpoint: settings.meetingNotes.endpoint,
+      maxInputCharacters: settings.meetingNotes.maxInputCharacters,
+      model: settings.meetingNotes.model,
+      requestTimeoutSeconds: settings.meetingNotes.requestTimeoutSeconds,
+    },
+    transcription: settings.transcription,
+    translation: {
+      enabled: settings.translation.enabled,
+      endpoint: settings.translation.endpoint,
+      model: settings.translation.model,
+      targetLanguage: settings.translation.targetLanguage,
+    },
   };
-  return <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">{paths[name]}</svg>;
+  return { secrets, settings: payload };
 }
 
-function App() {
+export function App() {
   const [tab, setTab] = useState<Tab>("record");
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [recording, setRecording] = useState<RecordingStatus>(DEFAULT_RECORDING_STATUS);
@@ -91,12 +122,148 @@ function App() {
   const [modelTransitioning, setModelTransitioning] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [secrets, setSecrets] = useState<SettingsSecretUpdates>(KEEP_SECRETS);
+  const [globalContext, setGlobalContext] = useState<GlobalContextDocument>(EMPTY_GLOBAL_CONTEXT_DOCUMENT);
+  const [globalDraft, setGlobalDraft] = useState<GlobalContextContent>(EMPTY_GLOBAL_CONTEXT);
+  const [globalNotice, setGlobalNotice] = useState<string | null>(null);
+  const [analyses, setAnalyses] = useState<Record<string, SessionAnalysisView>>({});
+  const [analysisStatuses, setAnalysisStatuses] = useState<Record<string, AnalysisStatus>>({});
+  const [analysisErrors, setAnalysisErrors] = useState<Record<string, unknown>>({});
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [analysisBusy, setAnalysisBusy] = useState<string | null>(null);
+  const analysisStatusRef = useRef<Record<string, AnalysisStatus>>({});
+  const analysisPending = useRef(false);
+  const expandedRef = useRef<string | null>(null);
   const t = useMemo(() => translator(settings.desktop.language), [settings.desktop.language]);
   const locale = resolveLanguage(settings.desktop.language);
 
   const refreshHistory = async () => {
     if (!isTauri) return;
     setHistory(await invoke<HistoryEntry[]>("list_recording_history", { limit: 100 }));
+  };
+
+  // Out-of-order status events and read responses are dropped instead of
+  // overwriting a newer snapshot of the same session.
+  const applyAnalysisStatus = (sessionId: string, candidate: AnalysisStatus) => {
+    const existing = analysisStatusRef.current[sessionId];
+    if (existing && !isNewerAnalysisStatus(candidate, existing)) return false;
+    analysisStatusRef.current = { ...analysisStatusRef.current, [sessionId]: candidate };
+    setAnalysisStatuses(analysisStatusRef.current);
+    return true;
+  };
+
+  const applyAnalysis = (view: SessionAnalysisView) => {
+    if (!applyAnalysisStatus(view.sessionId, analysisStatusFromView(view))) return;
+    setAnalyses((current) => ({ ...current, [view.sessionId]: view }));
+  };
+
+  const setAnalysisError = (sessionId: string, reason: unknown) => setAnalysisErrors((current) => ({ ...current, [sessionId]: reason }));
+
+  const loadAnalysis = async (sessionId: string) => {
+    if (!isTauri) return;
+    try {
+      applyAnalysis(await invoke<SessionAnalysisView>("get_session_analysis", { outputLanguage: locale, sessionId }));
+    } catch (reason) {
+      setAnalysisError(sessionId, reason);
+    }
+  };
+
+  const loadGlobalContext = async () => {
+    if (!isTauri) return;
+    const document = await invoke<GlobalContextDocument>("get_global_context");
+    setGlobalContext(document);
+    setGlobalDraft(document.content);
+  };
+
+  const toggleSession = (sessionId: string) => {
+    const next = expanded === sessionId ? null : sessionId;
+    expandedRef.current = next;
+    setExpanded(next);
+    if (!next) return;
+    setAnalysisError(next, null);
+    void loadAnalysis(next);
+    void loadGlobalContext().catch((reason) => setError(describeError(t, reason)));
+  };
+
+  const runAnalysisCommand = async (sessionId: string, command: () => Promise<SessionAnalysisView>) => {
+    if (!isTauri || analysisPending.current) return;
+    analysisPending.current = true;
+    setAnalysisBusy(sessionId);
+    setAnalysisError(sessionId, null);
+    try {
+      applyAnalysis(await command());
+    } catch (reason) {
+      setAnalysisError(sessionId, reason);
+      if (parseMeetingNotesError(reason)?.code === "CONTEXT_REVISION_CONFLICT") await loadAnalysis(sessionId);
+    } finally {
+      analysisPending.current = false;
+      setAnalysisBusy(null);
+    }
+  };
+
+  const saveMeetingContext = async (sessionId: string, content: MeetingContextContent) => {
+    if (!isTauri) return;
+    setAnalysisError(sessionId, null);
+    try {
+      await invoke<VersionedMeetingContext>("save_session_context", {
+        content,
+        expectedMeetingContextRevision: analyses[sessionId]?.meetingContext.revision ?? 0,
+        sessionId,
+      });
+      await loadAnalysis(sessionId);
+    } catch (reason) {
+      setAnalysisError(sessionId, reason);
+      if (parseMeetingNotesError(reason)?.code === "CONTEXT_REVISION_CONFLICT") await loadAnalysis(sessionId);
+    }
+  };
+
+  // The meeting context is confirmed first so the backend only ever generates
+  // from revisions the user has seen.
+  const generateAnalysis = (sessionId: string, content: MeetingContextContent, options: { acceptPartial: boolean; mode: GenerateMode }) =>
+    void runAnalysisCommand(sessionId, async () => {
+      const meeting = await invoke<VersionedMeetingContext>("save_session_context", {
+        content,
+        expectedMeetingContextRevision: analyses[sessionId]?.meetingContext.revision ?? 0,
+        sessionId,
+      });
+      return invoke<SessionAnalysisView>("generate_session_analysis", {
+        request: {
+          acceptPartial: options.acceptPartial,
+          expectedGlobalContextRevision: globalContext.revision,
+          expectedMeetingContextRevision: meeting.revision,
+          mode: options.mode,
+          outputLanguage: locale,
+          sessionId,
+        },
+      });
+    });
+
+  const controlRun = (sessionId: string, command: "cancel_session_analysis" | "retry_session_analysis") => {
+    const run = analyses[sessionId]?.currentRun;
+    if (!run) return;
+    void runAnalysisCommand(sessionId, () => invoke<SessionAnalysisView>(command, {
+      request: { expectedRunFingerprint: run.runFingerprint, jobId: run.jobId, outputLanguage: locale, sessionId },
+    }));
+  };
+
+  const saveGlobalContext = async () => {
+    if (!isTauri) return;
+    setBusy(true);
+    setGlobalNotice(null);
+    try {
+      const document = await invoke<GlobalContextDocument>("save_global_context", { content: globalDraft, expectedGlobalContextRevision: globalContext.revision });
+      setGlobalContext(document);
+      setGlobalDraft(document.content);
+      if (expandedRef.current) void loadAnalysis(expandedRef.current);
+    } catch (reason) {
+      setGlobalNotice(describeError(t, reason));
+      if (parseMeetingNotesError(reason)?.code === "CONTEXT_REVISION_CONFLICT") {
+        await loadGlobalContext();
+        setGlobalNotice(t("contextConflictReloaded"));
+      }
+    } finally {
+      setBusy(false);
+    }
   };
 
   const load = async () => {
@@ -109,13 +276,14 @@ function App() {
     try {
       const loadedSettings = await invoke<AppSettings>("get_settings");
       selectedModelId.current = loadedSettings.transcription.modelId;
-      const [loadedRecording, loadedModels, loadedModel, loadedTranscription, loadedHistory, info] =
+      const [loadedRecording, loadedModels, loadedModel, loadedTranscription, loadedHistory, loadedGlobalContext, info] =
         await Promise.all([
           invoke<RecordingStatus>("get_recording_status"),
           invoke<ModelCatalogEntry[]>("list_transcription_models"),
           invoke<ModelDownloadStatus>("get_model_status", { modelId: loadedSettings.transcription.modelId }),
           invoke<TranscriptionStatus>("get_transcription_status"),
           invoke<HistoryEntry[]>("list_recording_history", { limit: 100 }),
+          invoke<GlobalContextDocument>("get_global_context"),
           invoke<{ version: string }>("app_info"),
         ]);
       setSettings(loadedSettings);
@@ -125,6 +293,8 @@ function App() {
       setModel(loadedModel);
       setTranscription(loadedTranscription);
       setHistory(loadedHistory);
+      setGlobalContext(loadedGlobalContext);
+      setGlobalDraft(loadedGlobalContext.content);
       setVersion(info.version);
     } catch (reason) {
       setError(String(reason));
@@ -187,6 +357,23 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!isTauri) return;
+    let disposed = false;
+    let unlisten: UnlistenFn | null = null;
+    void listen<MeetingNotesStatusEvent>("meeting-notes-status", (event) => {
+      if (!applyAnalysisStatus(event.payload.sessionId, analysisStatusFromEvent(event.payload))) return;
+      if (expandedRef.current === event.payload.sessionId) void loadAnalysis(event.payload.sessionId);
+    }).then((subscription) => {
+      if (disposed) subscription();
+      else unlisten = subscription;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [locale]);
+
+  useEffect(() => {
     const sessionId = recording.sessionId;
     if (!sessionId) return;
     liveTranscriptSession.current = sessionId;
@@ -231,8 +418,9 @@ function App() {
     setBusy(true);
     setError(null);
     try {
-      const persisted = isTauri ? await invoke<AppSettings>("save_settings", { settings }) : settings;
+      const persisted = isTauri ? await invoke<AppSettings>("save_settings", saveSettingsPayload(settings, secrets)) : settings;
       setSettings(persisted);
+      setSecrets(KEEP_SECRETS);
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1800);
     } catch (reason) {
@@ -250,7 +438,7 @@ function App() {
         setRecording({ ...DEFAULT_RECORDING_STATUS, phase: "recording" });
         return;
       }
-      const persisted = await invoke<AppSettings>("save_settings", { settings });
+      const persisted = await invoke<AppSettings>("save_settings", saveSettingsPayload(settings));
       setSettings(persisted);
       const started = await invoke<RecordingStatus>("start_recording");
       liveTranscriptSession.current = started.sessionId;
@@ -297,7 +485,7 @@ function App() {
       }
       setSettings(nextSettings);
       if (isTauri) {
-        setSettings(await invoke<AppSettings>("save_settings", { settings: nextSettings }));
+        setSettings(await invoke<AppSettings>("save_settings", saveSettingsPayload(nextSettings)));
       }
     } catch (reason) {
       setError(String(reason));
@@ -333,7 +521,7 @@ function App() {
       }
       setSettings(nextSettings);
       if (isTauri) {
-        setSettings(await invoke<AppSettings>("save_settings", { settings: nextSettings }));
+        setSettings(await invoke<AppSettings>("save_settings", saveSettingsPayload(nextSettings)));
       }
     } catch (reason) {
       setError(String(reason));
@@ -456,8 +644,8 @@ function App() {
           {error && <div class="error-banner" role="alert"><strong>{t("error")}</strong><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
 
           {tab === "record" && <RecordView t={t} settings={settings} recording={recording} transcription={transcription} model={model} liveSegments={liveTranscript.segments} liveTranslations={liveTranscript.translations} busy={busy} isActive={isActive} changeLanguages={changeRecordingLanguages} changeSource={changeAudioSource} start={startRecording} stop={stopRecording} />}
-          {tab === "history" && <HistoryView t={t} locale={locale} history={history} refresh={() => void refreshHistory()} open={(sessionId) => void invoke("open_recording_directory", { sessionId }).catch((reason) => setError(String(reason)))} remove={(sessionId) => void deleteRecording(sessionId)} />}
-          {tab === "settings" && <SettingsView t={t} settings={settings} models={models} busy={busy || isActive} modelTransitioning={modelTransitioning} saved={saved} update={update} save={() => void saveSettings()} model={model} selectModel={(modelId) => void selectModel(modelId)} installModel={installModel} cancelModel={() => void cancelModel()} chooseOutputDirectory={() => void chooseOutputDirectory()} />}
+          {tab === "history" && <HistoryView t={t} locale={locale} history={history} analyses={analyses} analysisBusy={analysisBusy} analysisErrors={analysisErrors} analysisStatuses={analysisStatuses} expanded={expanded} globalContext={globalContext.content} settings={settings} cancel={(sessionId) => controlRun(sessionId, "cancel_session_analysis")} generate={generateAnalysis} openSettings={() => setTab("settings")} retry={(sessionId) => controlRun(sessionId, "retry_session_analysis")} saveContext={(sessionId, content) => void saveMeetingContext(sessionId, content)} toggle={toggleSession} refresh={() => void refreshHistory()} open={(sessionId) => void invoke("open_recording_directory", { sessionId }).catch((reason) => setError(String(reason)))} remove={(sessionId) => void deleteRecording(sessionId)} />}
+          {tab === "settings" && <SettingsView t={t} settings={settings} models={models} busy={busy || isActive} modelTransitioning={modelTransitioning} saved={saved} update={update} save={() => void saveSettings()} model={model} selectModel={(modelId) => void selectModel(modelId)} installModel={installModel} cancelModel={() => void cancelModel()} chooseOutputDirectory={() => void chooseOutputDirectory()} globalContext={globalDraft} globalNotice={globalNotice} globalRevision={globalContext.revision} saveGlobalContext={() => void saveGlobalContext()} secrets={secrets} updateGlobalContext={setGlobalDraft} updateSecret={(name, secret) => setSecrets((current) => ({ ...current, [name]: secret }))} />}
         </div>
       </main>
     </div>
@@ -584,13 +772,24 @@ function TranscriptionBadge({ t, status, model }: ViewProps & { status: Transcri
   return <span class="transcription-badge failed" title={status.error ?? label} aria-live="polite"><i />{label}</span>;
 }
 
-function HistoryView({ t, locale, history, refresh, open, remove }: ViewProps & { locale: string; history: HistoryEntry[]; refresh: () => void; open: (id: string) => void; remove: (id: string) => void }) {
+export function HistoryView({ t, locale, history, analyses, analysisBusy, analysisErrors, analysisStatuses, expanded, globalContext, settings, cancel, generate, openSettings, retry, saveContext, toggle, refresh, open, remove }: ViewProps & {
+  locale: string; history: HistoryEntry[]; analyses: Record<string, SessionAnalysisView>; analysisBusy: string | null; analysisErrors: Record<string, unknown>; analysisStatuses: Record<string, AnalysisStatus>; expanded: string | null; globalContext: GlobalContextContent; settings: AppSettings;
+  cancel: (id: string) => void; generate: (id: string, content: MeetingContextContent, options: { acceptPartial: boolean; mode: GenerateMode }) => void; openSettings: () => void; retry: (id: string) => void; saveContext: (id: string, content: MeetingContextContent) => void; toggle: (id: string) => void; refresh: () => void; open: (id: string) => void; remove: (id: string) => void;
+}) {
   return <div class="view-stack"><div class="view-actions"><p>{history.length} {t("history").toLowerCase()}</p><button class="icon-button" onClick={refresh}><Icon name="refresh" />{t("refresh")}</button></div>
-    {history.length === 0 ? <section class="empty-state"><span><Icon name="history" /></span><h2>{t("noHistory")}</h2><p>{t("noHistoryHint")}</p></section> : <div class="history-list">{history.map((entry) => <article class="history-card" key={entry.sessionId}><div class="history-date"><strong>{new Date(entry.startedAt).toLocaleDateString(locale, { month: "short", day: "numeric" })}</strong><span>{new Date(entry.startedAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" })}</span></div><div class="history-body"><div class="history-title"><strong>{sourceLabel(t, entry.audioSource)}</strong><span>{formatDuration(entry.durationMs)} · {entry.audioFormat.toUpperCase()}</span></div><p class="history-transcript">{entry.transcriptPreview || t("noTranscript")}</p>{entry.translationStatus && <p class="history-translation"><strong>{entry.translationTargetLanguage ? `${t("translateTo")} ${translationLanguageLabel(t, entry.translationTargetLanguage)}` : t("translation")}</strong><span>{entry.translationPreview || (entry.translationStatus === "partial" ? t("translationFailed") : t("translating"))}</span></p>}<div class="history-tags"><span>{t(entry.status === "recording" ? "recording" : entry.status === "interrupted" ? "interrupted" : entry.status === "failed" ? "failed" : "completed")}</span>{entry.transcriptStatus && <span>{t(entry.transcriptStatus === "complete" ? "transcriptComplete" : entry.transcriptStatus === "partial" ? "transcriptPartial" : "transcriptPending")}</span>}{entry.translationStatus && <span>{t(entry.translationStatus === "complete" ? "translationComplete" : entry.translationStatus === "partial" ? "translationPartial" : "translationPending")}</span>}</div></div><div class="history-actions"><button class="folder-button" title={t("openFolder")} onClick={() => open(entry.sessionId)}><Icon name="folder" /></button><button class="folder-button delete-button" disabled={entry.status === "recording"} title={t("deleteRecording")} onClick={() => remove(entry.sessionId)}><Icon name="trash" /></button></div></article>)}</div>}
+    {history.length === 0 ? <section class="empty-state"><span><Icon name="history" /></span><h2>{t("noHistory")}</h2><p>{t("noHistoryHint")}</p></section> : <div class="history-list">{history.map((entry) => { const isOpen = expanded === entry.sessionId; return <div class="history-item" key={entry.sessionId}>
+      <article class={`history-card ${isOpen ? "expanded" : ""}`} onClick={() => toggle(entry.sessionId)}><div class="history-date"><strong>{new Date(entry.startedAt).toLocaleDateString(locale, { month: "short", day: "numeric" })}</strong><span>{new Date(entry.startedAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" })}</span></div><div class="history-body"><div class="history-title"><strong>{sourceLabel(t, entry.audioSource)}</strong><span>{formatDuration(entry.durationMs)} · {entry.audioFormat.toUpperCase()}</span></div><p class="history-transcript">{entry.transcriptPreview || t("noTranscript")}</p>{entry.translationStatus && <p class="history-translation"><strong>{entry.translationTargetLanguage ? `${t("translateTo")} ${translationLanguageLabel(t, entry.translationTargetLanguage)}` : t("translation")}</strong><span>{entry.translationPreview || (entry.translationStatus === "partial" ? t("translationFailed") : t("translating"))}</span></p>}<div class="history-tags"><span>{t(entry.status === "recording" ? "recording" : entry.status === "interrupted" ? "interrupted" : entry.status === "failed" ? "failed" : "completed")}</span>{entry.transcriptStatus && <span>{t(entry.transcriptStatus === "complete" ? "transcriptComplete" : entry.transcriptStatus === "partial" ? "transcriptPartial" : "transcriptPending")}</span>}{entry.translationStatus && <span>{t(entry.translationStatus === "complete" ? "translationComplete" : entry.translationStatus === "partial" ? "translationPartial" : "translationPending")}</span>}<MeetingNotesChips analysis={analyses[entry.sessionId] ?? null} state={analysisStatuses[entry.sessionId]?.state ?? null} t={t} /></div></div><div class="history-actions"><button aria-expanded={isOpen} class="folder-button" title={t("meetingNotes")} onClick={(event) => { event.stopPropagation(); toggle(entry.sessionId); }}><Icon name="text" /></button><button class="folder-button" title={t("openFolder")} onClick={(event) => { event.stopPropagation(); open(entry.sessionId); }}><Icon name="folder" /></button><button class="folder-button delete-button" disabled={entry.status === "recording"} title={t("deleteRecording")} onClick={(event) => { event.stopPropagation(); remove(entry.sessionId); }}><Icon name="trash" /></button></div></article>
+      {isOpen && <MeetingNotesDetail analysis={analyses[entry.sessionId] ?? null} busy={analysisBusy === entry.sessionId} entry={entry} error={analysisErrors[entry.sessionId] ?? null} globalContext={globalContext} locale={locale} settings={settings} t={t} cancel={() => cancel(entry.sessionId)} generate={(content, options) => generate(entry.sessionId, content, options)} openSettings={openSettings} retry={() => retry(entry.sessionId)} saveContext={(content) => saveContext(entry.sessionId, content)} />}
+    </div>; })}</div>}
   </div>;
 }
 
-function SettingsView({ t, settings, models, busy, modelTransitioning, saved, update, save, model, selectModel, installModel, cancelModel, chooseOutputDirectory }: ViewProps & { settings: AppSettings; models: ModelCatalogEntry[]; busy: boolean; modelTransitioning: boolean; saved: boolean; update: (mutate: (next: AppSettings) => void) => void; save: () => void; model: ModelDownloadStatus; selectModel: (modelId: string) => void; installModel: () => void; cancelModel: () => void; chooseOutputDirectory: () => void }) {
+export function SettingsView({ t, settings, models, busy, modelTransitioning, saved, update, save, model, selectModel, installModel, cancelModel, chooseOutputDirectory, globalContext, globalNotice, globalRevision, saveGlobalContext, secrets, updateGlobalContext, updateSecret }: ViewProps & {
+  settings: AppSettings; models: ModelCatalogEntry[]; busy: boolean; modelTransitioning: boolean; saved: boolean; update: (mutate: (next: AppSettings) => void) => void; save: () => void; model: ModelDownloadStatus; selectModel: (modelId: string) => void; installModel: () => void; cancelModel: () => void; chooseOutputDirectory: () => void;
+  globalContext: GlobalContextContent; globalNotice: string | null; globalRevision: number; saveGlobalContext: () => void; secrets: SettingsSecretUpdates; updateGlobalContext: (content: GlobalContextContent) => void; updateSecret: (name: keyof SettingsSecretUpdates, secret: SecretUpdate) => void;
+}) {
+  const translationBlocked = secretBlocksSave(settings.translation.endpoint, settings.translation.apiKeyConfigured, secrets.translationApiKey);
+  const meetingNotesBlocked = secretBlocksSave(settings.meetingNotes.endpoint, settings.meetingNotes.apiKeyConfigured, secrets.meetingNotesApiKey);
   return <div class="settings-stack">
     <SettingsSection icon="mic" title={t("audio")}>
       <div class="form-grid"><RangeField label={t("microphoneGain")} value={settings.audio.microphoneGain} min={0} max={4} step={0.1} suffix="×" onChange={(value) => update((next) => { next.audio.microphoneGain = value; })} /><RangeField label={t("systemGain")} value={settings.audio.systemGain} min={0} max={4} step={0.1} suffix="×" onChange={(value) => update((next) => { next.audio.systemGain = value; })} />
@@ -610,16 +809,19 @@ function SettingsView({ t, settings, models, busy, modelTransitioning, saved, up
       </div>
     </SettingsSection>
 
-    <SettingsSection icon="text" title={t("translation")}><Toggle label={t("enableTranslation")} checked={settings.translation.enabled} onChange={(checked) => update((next) => { next.translation.enabled = checked; })} /><div class="form-grid"><SelectField disabled={!settings.translation.enabled} label={t("translationLanguage")} value={settings.translation.targetLanguage} onChange={(value) => update((next) => { next.translation.targetLanguage = value; })} options={[{ value: "Chinese", label: t("chinese") }, { value: "English", label: t("english") }, { value: "Japanese", label: t("japanese") }, { value: "Korean", label: t("korean") }]} /><TextField disabled={!settings.translation.enabled} label={t("translationModel")} value={settings.translation.model} onChange={(value) => update((next) => { next.translation.model = value; })} /><TextField className="field-wide" disabled={!settings.translation.enabled} label={t("translationEndpoint")} type="url" value={settings.translation.endpoint} onChange={(value) => update((next) => { next.translation.endpoint = value; })} /></div></SettingsSection>
+    <SettingsSection icon="text" title={t("translation")}><Toggle label={t("enableTranslation")} checked={settings.translation.enabled} onChange={(checked) => update((next) => { next.translation.enabled = checked; })} /><div class="form-grid"><SelectField disabled={!settings.translation.enabled} label={t("translationLanguage")} value={settings.translation.targetLanguage} onChange={(value) => update((next) => { next.translation.targetLanguage = value; })} options={[{ value: "Chinese", label: t("chinese") }, { value: "English", label: t("english") }, { value: "Japanese", label: t("japanese") }, { value: "Korean", label: t("korean") }]} /><TextField disabled={!settings.translation.enabled} label={t("translationModel")} value={settings.translation.model} onChange={(value) => update((next) => { next.translation.model = value; })} /><TextField className="field-wide" disabled={!settings.translation.enabled} label={t("translationEndpoint")} type="url" value={settings.translation.endpoint} onChange={(value) => update((next) => { next.translation.endpoint = value; })} /><ApiKeyField configured={settings.translation.apiKeyConfigured} secret={secrets.translationApiKey} t={t} onChange={(secret) => updateSecret("translationApiKey", secret)} /></div><EndpointWarning blocked={translationBlocked} endpoint={settings.translation.endpoint} t={t} /></SettingsSection>
+
+    <MeetingNotesProviderSection blocked={meetingNotesBlocked} secret={secrets.meetingNotesApiKey} settings={settings} t={t} update={update} onSecret={(secret) => updateSecret("meetingNotesApiKey", secret)} />
+
+    <GlobalContextSection busy={busy} content={globalContext} notice={globalNotice} revision={globalRevision} save={saveGlobalContext} t={t} onChange={updateGlobalContext} />
 
     <SettingsSection icon="gear" title={t("desktop")}><Toggle label={t("hideOnClose")} checked={settings.desktop.hideWindowOnClose} onChange={(checked) => update((next) => { next.desktop.hideWindowOnClose = checked; })} /><Toggle label={t("launchAtLogin")} checked={settings.desktop.launchAtLogin} onChange={(checked) => update((next) => { next.desktop.launchAtLogin = checked; })} /><Toggle label={t("recordOnLaunch")} checked={settings.desktop.startRecordingOnLaunch} onChange={(checked) => update((next) => { next.desktop.startRecordingOnLaunch = checked; })} /></SettingsSection>
 
     <SettingsSection icon="gear" title={t("appearance")}><div class="form-grid"><SelectField label={t("theme")} value={settings.desktop.theme} onChange={(value) => update((next) => { next.desktop.theme = value as AppSettings["desktop"]["theme"]; })} options={[{ value: "system", label: t("themeSystem") }, { value: "light", label: t("themeLight") }, { value: "dark", label: t("themeDark") }]} /><SelectField label={t("language")} value={settings.desktop.language} onChange={(value) => update((next) => { next.desktop.language = value as AppSettings["desktop"]["language"]; })} options={[{ value: "system", label: t("langSystem") }, { value: "zh-CN", label: t("langChinese") }, { value: "en-US", label: t("langEnglish") }]} /></div></SettingsSection>
-    <div class="save-bar"><button class="primary-button" disabled={busy} onClick={save}>{saved ? <><Icon name="check" />{t("saved")}</> : t("saveSettings")}</button></div>
+    <div class="save-bar">{(translationBlocked || meetingNotesBlocked) && <p class="save-blocked">{t("insecureEndpointBlocked")}</p>}<button class="primary-button" disabled={busy || translationBlocked || meetingNotesBlocked} onClick={save}>{saved ? <><Icon name="check" />{t("saved")}</> : t("saveSettings")}</button></div>
   </div>;
 }
 
-function SettingsSection({ icon, title, action, children }: { icon: IconName; title: string; action?: preact.ComponentChildren; children: preact.ComponentChildren }) { return <section class="panel-card settings-section"><div class={`section-heading ${action ? "has-action" : ""}`}><div><span class="section-icon"><Icon name={icon} /></span><h2>{title}</h2></div>{action}</div>{children}</section>; }
 function ModelActionButton({ t, model, busy, install, cancel }: ViewProps & { model: ModelDownloadStatus; busy: boolean; install: () => void; cancel: () => void }) {
   const progress = model.totalBytes > 0 ? Math.min(100, model.downloadedBytes / model.totalBytes * 100) : 0;
   const downloaded = model.phase === "downloaded";
@@ -644,11 +846,6 @@ function ModelActionButton({ t, model, busy, install, cancel }: ViewProps & { mo
   </button>;
 }
 
-function SelectField({ label, value, options, disabled = false, onChange }: { label: string; value: string; options: { value: string; label: string }[]; disabled?: boolean; onChange: (value: string) => void }) { return <label class="field"><span>{label}</span><select value={value} disabled={disabled} onChange={(event) => onChange(event.currentTarget.value)}>{options.map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}</select></label>; }
-function TextField({ label, value, onChange, type = "text", disabled = false, className = "" }: { label: string; value: string; onChange: (value: string) => void; type?: "text" | "url"; disabled?: boolean; className?: string }) { return <label class={`field ${className}`}><span>{label}</span><input disabled={disabled} type={type} value={value} onInput={(event) => onChange(event.currentTarget.value)} /></label>; }
-function NumberField({ label, value, min, max, onChange }: { label: string; value: number; min: number; max: number; onChange: (value: number) => void }) { return <label class="field"><span>{label}</span><input type="number" value={value} min={min} max={max} onChange={(event) => onChange(Number(event.currentTarget.value))} /></label>; }
-function RangeField({ label, value, min, max, step, suffix, onChange }: { label: string; value: number; min: number; max: number; step: number; suffix: string; onChange: (value: number) => void }) { return <label class="range-field"><span><b>{label}</b><em>{value.toFixed(step < 0.1 ? 2 : 1)}{suffix}</em></span><input type="range" value={value} min={min} max={max} step={step} onInput={(event) => onChange(Number(event.currentTarget.value))} /></label>; }
-function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) { return <label class="toggle-row"><span>{label}</span><input type="checkbox" checked={checked} onChange={(event) => onChange(event.currentTarget.checked)} /><i /></label>; }
 function Level({ label, value, muted }: { label: string; value: number; muted: boolean }) {
   const normalizedValue = Math.max(-80, Math.min(0, value));
   const displayValue = muted ? "—" : `${Math.round(value)} dB`;
@@ -707,7 +904,6 @@ function mergeTranslations(fetched: TranslationSegment[], received: TranslationS
   const base = [...fetched].sort((a, b) => a.segmentId - b.segmentId);
   return received.reduce(upsertTranslation, base);
 }
-function formatDuration(milliseconds: number) { const total = Math.floor(milliseconds / 1000); const hours = Math.floor(total / 3600); const minutes = Math.floor(total % 3600 / 60); const seconds = total % 60; return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`; }
-function formatBytes(bytes: number) { if (bytes <= 0) return "0 B"; const units = ["B", "KB", "MB", "GB"]; const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024))); return `${(bytes / 1024 ** index).toFixed(index > 1 ? 1 : 0)} ${units[index]}`; }
 
-render(<App />, document.getElementById("app")!);
+const root = document.getElementById("app");
+if (root) render(<App />, root);

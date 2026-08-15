@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
     thread::{self, JoinHandle},
     time::Duration,
@@ -13,7 +13,11 @@ use crate::{
     audio::{AudioBlockError, ResampleStreamError},
     capture::{CaptureError, CaptureEvent, CaptureSession, CaptureSource, start_capture},
     models::{ModelError, ModelManager},
-    settings::{AudioSettings, AudioSourceMode, TranscriptionSettings, TranslationSettings},
+    session_catalog::SessionCatalog,
+    settings::{
+        AudioSettings, AudioSourceMode, TranscriptionSettings, TranslationSettings,
+        TranslationSnapshot,
+    },
     storage::{RecordingArchive, SessionManifest, StorageError, recover_interrupted_sessions},
     transcription::{TranscriptionError, TranscriptionService},
     vad::VadError,
@@ -82,6 +86,7 @@ impl Default for RecordingStatus {
 
 pub struct RecordingService {
     active: Mutex<Option<ActiveRecording>>,
+    catalog: Option<Arc<SessionCatalog>>,
     default_root: PathBuf,
     models: Option<Arc<ModelManager>>,
     observer: StatusObserver,
@@ -92,7 +97,7 @@ pub struct RecordingService {
 #[derive(Clone)]
 pub(super) struct RecordingTranscriptionConfig {
     pub(super) transcription: TranscriptionSettings,
-    pub(super) translation: TranslationSettings,
+    pub(super) translation: TranslationSnapshot,
 }
 
 impl RecordingService {
@@ -101,7 +106,7 @@ impl RecordingService {
     }
 
     pub fn with_observer(default_root: PathBuf, observer: StatusObserver) -> Self {
-        Self::with_services(default_root, observer, None, None)
+        Self::with_services(default_root, observer, None, None, None)
     }
 
     pub fn with_services(
@@ -109,9 +114,11 @@ impl RecordingService {
         observer: StatusObserver,
         transcription: Option<Arc<TranscriptionService>>,
         models: Option<Arc<ModelManager>>,
+        catalog: Option<Arc<SessionCatalog>>,
     ) -> Self {
         Self {
             active: Mutex::new(None),
+            catalog,
             default_root,
             models,
             observer,
@@ -154,6 +161,7 @@ impl RecordingService {
             .unwrap_or_else(|| self.default_root.clone());
         recover_interrupted_sessions(&output_root)?;
         let archive = RecordingArchive::create(&output_root, &settings)?;
+        self.register_root(&output_root);
         self.replace_status(RecordingStatus {
             audio_source: settings.source,
             phase: RecordingPhase::Starting,
@@ -196,7 +204,7 @@ impl RecordingService {
         let transcription = self.transcription.clone();
         let transcription_config = Arc::new(RwLock::new(RecordingTranscriptionConfig {
             transcription: transcription_settings,
-            translation: translation_settings,
+            translation: translation_settings.snapshot(),
         }));
         let context = RecordingWorkerContext {
             observer,
@@ -337,6 +345,15 @@ impl RecordingService {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Best effort: a catalog write must never stop a recording from starting.
+    fn register_root(&self, root: &Path) {
+        if let Some(catalog) = &self.catalog
+            && let Err(error) = catalog.register_root(root)
+        {
+            tracing::warn!(?error, "failed to register the recording root");
+        }
     }
 
     fn replace_status(&self, status: RecordingStatus) {

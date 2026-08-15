@@ -17,7 +17,8 @@ npm run check:rust       # cargo check
 npm run format:check     # cargo fmt --check
 npm run lint             # cargo clippy --all-targets --all-features -- -D warnings
 npm test                 # cargo test (all Rust unit tests)
-npm run verify           # build + format:check + lint + test — run before completing a task or releasing
+npm run test:web         # vitest run (frontend tests, jsdom + Testing Library for Preact)
+npm run verify           # build + format:check + lint + test + test:web — run before completing a task or releasing
 npm run bundle           # production packaging (tauri build)
 ```
 
@@ -51,7 +52,7 @@ Full details in docs/ARCHITECTURE.md. The essentials:
 
 Some modules split large files with `#[path = "..."]` includes — e.g. `recording.rs` pulls in `recording_worker.rs`, `models.rs` pulls in `model_catalog.rs`/`model_files.rs`, and tests live in sibling `*_tests.rs` files included the same way.
 
-**Frontend:** three files — `src/main.tsx` (entire UI), `src/types.ts` (mirrors Rust IPC types, camelCase via serde rename), `src/i18n.ts` (translations). No UI framework beyond Preact; keep it dependency-free. When adding/changing an IPC command or status struct, update `src/types.ts` to match the Rust serde output.
+**Frontend:** `src/main.tsx` (recorder, settings, history), `src/ui.tsx` and `src/meeting_notes_ui.tsx` (shared controls and the meeting-notes views), `src/types.ts` (mirrors Rust IPC types, camelCase via serde rename), `src/i18n.ts` (translations); tests live in `src/__tests__/`. No UI framework beyond Preact; keep it dependency-free. When adding/changing an IPC command or status struct, update `src/types.ts` to match the Rust serde output.
 
 ## Constraints & Gotchas
 

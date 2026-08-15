@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -12,15 +12,21 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use reqwest::{StatusCode, Url, blocking::Client};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::settings::TranslationSettings;
+use crate::{
+    openai_compatible::{
+        ChatCompletionPort, ChatError, ChatMessage, ChatRequest, ChatRole, ReqwestChatClient,
+    },
+    session_lifecycle::SessionLifecycle,
+    settings::{ProviderAuthMode, ProviderCredentials, TranslationSnapshot},
+};
 
 pub const DOCUMENT_NAME: &str = "translation.json";
 const MAX_ATTEMPTS: u32 = 3;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub type TranslationObserver = Arc<dyn Fn(TranslationSegmentUpdate) + Send + Sync + 'static>;
@@ -64,6 +70,8 @@ pub struct TranslationSegmentUpdate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranslationDocument {
+    #[serde(default)]
+    pub auth_mode: ProviderAuthMode,
     pub endpoint: String,
     pub model: String,
     pub schema_version: u32,
@@ -81,23 +89,47 @@ pub struct TranslationService {
 }
 
 struct TranslationInner {
-    client: Client,
-    document_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    chat: Arc<dyn ChatCompletionPort>,
+    credentials: ProviderCredentials,
     known_sessions: Mutex<HashSet<PathBuf>>,
+    lifecycle: Arc<SessionLifecycle>,
     observer: TranslationObserver,
     stop: AtomicBool,
 }
 
 impl TranslationService {
     pub fn new(observer: TranslationObserver) -> Result<Self, TranslationError> {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(60))
-            .build()?;
+        Self::with_credentials(
+            observer,
+            ProviderCredentials::default(),
+            SessionLifecycle::new(),
+        )
+    }
+
+    pub fn with_credentials(
+        observer: TranslationObserver,
+        credentials: ProviderCredentials,
+        lifecycle: Arc<SessionLifecycle>,
+    ) -> Result<Self, TranslationError> {
+        Self::with_chat_client(
+            observer,
+            credentials,
+            Arc::new(ReqwestChatClient::new()?),
+            lifecycle,
+        )
+    }
+
+    pub fn with_chat_client(
+        observer: TranslationObserver,
+        credentials: ProviderCredentials,
+        chat: Arc<dyn ChatCompletionPort>,
+        lifecycle: Arc<SessionLifecycle>,
+    ) -> Result<Self, TranslationError> {
         let inner = Arc::new(TranslationInner {
-            client,
-            document_locks: Mutex::new(HashMap::new()),
+            chat,
+            credentials,
             known_sessions: Mutex::new(HashSet::new()),
+            lifecycle,
             observer,
             stop: AtomicBool::new(false),
         });
@@ -119,29 +151,34 @@ impl TranslationService {
         session_id: &str,
         segment_id: u32,
         source_text: &str,
-        settings: &TranslationSettings,
+        translation: &TranslationSnapshot,
     ) -> Result<Option<TranslationSegment>, TranslationError> {
-        if !settings.enabled || source_text.trim().is_empty() {
+        if !translation.enabled || source_text.trim().is_empty() {
             return Ok(None);
         }
         let lock = self.inner.document_lock(session_dir);
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.inner.lifecycle.is_deleting(session_dir) {
+            return Ok(None);
+        }
         let path = session_dir.join(DOCUMENT_NAME);
         let mut document = if path.exists() {
             let mut document = load_document(&path)?;
-            document.endpoint = settings.endpoint.trim().to_owned();
-            document.model = settings.model.trim().to_owned();
-            document.target_language = settings.target_language.trim().to_owned();
+            document.auth_mode = translation.auth_mode;
+            document.endpoint = translation.endpoint.clone();
+            document.model = translation.model.clone();
+            document.target_language = translation.target_language.clone();
             document
         } else {
             TranslationDocument {
-                endpoint: settings.endpoint.trim().to_owned(),
-                model: settings.model.trim().to_owned(),
+                auth_mode: translation.auth_mode,
+                endpoint: translation.endpoint.clone(),
+                model: translation.model.clone(),
                 schema_version: 1,
                 segments: Vec::new(),
                 session_id: session_id.to_owned(),
                 status: TranslationDocumentStatus::Pending,
-                target_language: settings.target_language.trim().to_owned(),
+                target_language: translation.target_language.clone(),
                 updated_at: Utc::now(),
             }
         };
@@ -189,6 +226,16 @@ impl TranslationService {
         self.inner.publish(session_id, &segment);
         let _ = self.wake.try_send(());
         Ok(Some(segment))
+    }
+
+    /// Stops the worker from picking the session up again. The in-flight request
+    /// is left alone: its response is dropped by the commit guard.
+    pub fn forget(&self, session_dir: &Path) {
+        self.inner
+            .known_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_dir);
     }
 
     pub fn recover_root(&self, root: &Path) -> Result<usize, TranslationError> {
@@ -249,12 +296,7 @@ impl Drop for TranslationService {
 
 impl TranslationInner {
     fn document_lock(&self, session_dir: &Path) -> Arc<Mutex<()>> {
-        self.document_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(session_dir.to_path_buf())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        self.lifecycle.session_lock(session_dir)
     }
 
     fn publish(&self, session_id: &str, segment: &TranslationSegment) {
@@ -307,7 +349,7 @@ fn worker_loop(inner: Arc<TranslationInner>, receiver: crossbeam_channel::Receiv
 /// Returns true while this session still has retryable work.
 fn process_session(inner: &TranslationInner, session_dir: &Path) -> Result<bool, TranslationError> {
     let path = session_dir.join(DOCUMENT_NAME);
-    if !path.exists() {
+    if !path.exists() || inner.lifecycle.is_deleting(session_dir) {
         return Ok(false);
     }
     let lock = inner.document_lock(session_dir);
@@ -344,15 +386,21 @@ fn process_session(inner: &TranslationInner, session_dir: &Path) -> Result<bool,
     inner.publish(&document.session_id, &processing);
 
     let result = translate_text(
-        &inner.client,
-        &document.endpoint,
-        &document.model,
-        &document.target_language,
+        inner.chat.as_ref(),
+        &inner.credentials,
+        &document,
         &processing.source_text,
     );
 
     let (session_id, resolved, retryable) = {
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The tombstone, the marker and the directory are checked under the same
+        // lifecycle lock the delete takes, so a late response is dropped here
+        // instead of racing the removal.
+        if inner.lifecycle.is_deleting(session_dir) || !session_dir.is_dir() {
+            tracing::debug!(segment_id, "dropped a translation for a deleted session");
+            return Ok(false);
+        }
         let mut latest = load_document(&path)?;
         let item = latest
             .segments
@@ -386,83 +434,39 @@ fn process_session(inner: &TranslationInner, session_dir: &Path) -> Result<bool,
 }
 
 fn translate_text(
-    client: &Client,
-    endpoint: &str,
-    model: &str,
-    target_language: &str,
+    chat: &dyn ChatCompletionPort,
+    credentials: &ProviderCredentials,
+    document: &TranslationDocument,
     source_text: &str,
 ) -> Result<String, TranslationError> {
-    let url = chat_completions_url(endpoint)?;
-    let body = serde_json::json!({
-        "model": model,
-        "temperature": 0,
-        "messages": [
-            {
-                "role": "system",
-                "content": format!(
-                    "Translate the user's text into {target_language}. Preserve meaning, names, numbers, and formatting. Return only the translation."
-                )
-            },
-            { "role": "user", "content": source_text }
-        ]
-    });
-    let response = client
-        .post(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body.to_string())
-        .send()?;
-    let status = response.status();
-    let response_body = response.text()?;
-    if !status.is_success() {
-        return Err(TranslationError::HttpStatus(
-            status,
-            response_body.chars().take(500).collect(),
-        ));
-    }
-    parse_translation_response(&response_body)
-}
-
-fn chat_completions_url(endpoint: &str) -> Result<Url, TranslationError> {
-    let mut url = Url::parse(endpoint.trim()).map_err(|_| TranslationError::InvalidEndpoint)?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(TranslationError::InvalidEndpoint);
-    }
-    let base_path = url.path().trim_end_matches('/');
-    let path = if base_path.ends_with("/chat/completions") {
-        base_path.to_owned()
-    } else if base_path.is_empty() {
-        "/chat/completions".to_owned()
-    } else {
-        format!("{base_path}/chat/completions")
+    let api_key = match document.auth_mode {
+        ProviderAuthMode::None => None,
+        ProviderAuthMode::Bearer => Some(
+            credentials
+                .translation_key(&document.endpoint)
+                .ok_or(TranslationError::ProviderChanged)?,
+        ),
     };
-    url.set_path(&path);
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url)
-}
-
-fn parse_translation_response(body: &str) -> Result<String, TranslationError> {
-    #[derive(Deserialize)]
-    struct Response {
-        choices: Vec<Choice>,
-    }
-    #[derive(Deserialize)]
-    struct Choice {
-        message: Message,
-    }
-    #[derive(Deserialize)]
-    struct Message {
-        content: String,
-    }
-
-    let parsed: Response = serde_json::from_str(body)?;
-    let text = parsed
-        .choices
-        .first()
-        .map(|choice| choice.message.content.trim())
-        .filter(|text| !text.is_empty())
-        .ok_or(TranslationError::EmptyResponse)?;
-    Ok(text.to_owned())
+    let instruction = format!(
+        "Translate the user's text into {}. Preserve meaning, names, numbers, and formatting. Return only the translation.",
+        document.target_language
+    );
+    Ok(chat.complete(ChatRequest {
+        api_key: api_key.as_ref(),
+        endpoint: &document.endpoint,
+        messages: vec![
+            ChatMessage {
+                content: &instruction,
+                role: ChatRole::System,
+            },
+            ChatMessage {
+                content: source_text,
+                role: ChatRole::User,
+            },
+        ],
+        model: &document.model,
+        timeout: REQUEST_TIMEOUT,
+    })?)
 }
 
 fn is_retryable(segment: &TranslationSegment) -> bool {
@@ -489,9 +493,13 @@ fn load_document(path: &Path) -> Result<TranslationDocument, TranslationError> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
+/// Never recreates the session directory: a deleted session must stay deleted
+/// even when a late response arrives.
 fn save_document(path: &Path, document: &TranslationDocument) -> Result<(), TranslationError> {
     let parent = path.parent().ok_or(TranslationError::InvalidDocumentPath)?;
-    fs::create_dir_all(parent)?;
+    if !parent.is_dir() {
+        return Err(TranslationError::MissingSessionDirectory);
+    }
     let mut temporary = NamedTempFile::new_in(parent)?;
     serde_json::to_writer_pretty(&mut temporary, document)?;
     temporary.write_all(b"\n")?;
@@ -525,22 +533,20 @@ fn collect_documents(
 
 #[derive(Debug, Error)]
 pub enum TranslationError {
-    #[error("translation endpoint returned an empty response")]
-    EmptyResponse,
-    #[error("translation endpoint returned HTTP {0}: {1}")]
-    HttpStatus(StatusCode, String),
+    #[error(transparent)]
+    Chat(#[from] ChatError),
     #[error("translation document path is invalid")]
     InvalidDocumentPath,
-    #[error("translation endpoint must be a valid http or https URL")]
-    InvalidEndpoint,
     #[error("failed to access translation: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to parse translation: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("translation session directory no longer exists")]
+    MissingSessionDirectory,
     #[error("failed to persist translation: {0}")]
     Persist(#[from] tempfile::PersistError),
-    #[error("translation request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    #[error("translation provider credentials changed")]
+    ProviderChanged,
     #[error("translation segment {0} is missing")]
     SegmentMissing(u32),
     #[error("translation belongs to a different recording session")]
@@ -549,44 +555,129 @@ pub enum TranslationError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Read, Write},
-        net::TcpListener,
+    use super::*;
+    use crate::{
+        openai_compatible::test_support::ScriptedChatClient,
+        settings::{
+            AppSettings, AppSettingsWithoutSecrets, MeetingNotesSettingsWithoutSecrets,
+            SecretUpdate, SettingsSecretUpdates, SettingsStore, TranslationSettingsWithoutSecrets,
+        },
     };
 
-    use super::*;
-
-    #[test]
-    fn builds_chat_completions_url_from_base_or_full_endpoint() {
-        assert_eq!(
-            chat_completions_url("http://127.0.0.1:8000/v1")
-                .unwrap()
-                .as_str(),
-            "http://127.0.0.1:8000/v1/chat/completions"
-        );
-        assert_eq!(
-            chat_completions_url("http://localhost:8000/v1/chat/completions/")
-                .unwrap()
-                .as_str(),
-            "http://localhost:8000/v1/chat/completions"
-        );
+    /// Blocks inside `complete` until the test releases it, so a delete can be
+    /// interleaved with a request that is already on the wire.
+    struct GatedChatClient {
+        release: Mutex<Option<crossbeam_channel::Receiver<()>>>,
+        requests: Mutex<usize>,
     }
 
-    #[test]
-    fn parses_openai_chat_completion_content() {
-        let body = r#"{"choices":[{"message":{"content":"  Hello world.  "}}]}"#;
+    impl GatedChatClient {
+        fn new() -> (Arc<Self>, crossbeam_channel::Sender<()>) {
+            let (sender, receiver) = crossbeam_channel::bounded(1);
+            (
+                Arc::new(Self {
+                    release: Mutex::new(Some(receiver)),
+                    requests: Mutex::new(0),
+                }),
+                sender,
+            )
+        }
 
-        assert_eq!(parse_translation_response(body).unwrap(), "Hello world.");
+        fn wait_for_request(&self) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while *self.requests.lock().unwrap() == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for the translation request"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 
-    #[test]
-    fn rejects_empty_chat_completion_content() {
-        let body = r#"{"choices":[{"message":{"content":"  "}}]}"#;
+    impl ChatCompletionPort for GatedChatClient {
+        fn complete(&self, _request: ChatRequest<'_>) -> Result<String, ChatError> {
+            *self.requests.lock().unwrap() += 1;
+            let gate = self.release.lock().unwrap().take();
+            if let Some(gate) = gate {
+                let _ = gate.recv_timeout(Duration::from_secs(5));
+            }
+            Ok("translated".to_owned())
+        }
+    }
 
-        assert!(matches!(
-            parse_translation_response(body),
-            Err(TranslationError::EmptyResponse)
-        ));
+    /// Marks the session as deleting while its request is on the wire.
+    struct MarkingChatClient {
+        lifecycle: Arc<SessionLifecycle>,
+        session_dir: PathBuf,
+    }
+
+    impl ChatCompletionPort for MarkingChatClient {
+        fn complete(&self, _request: ChatRequest<'_>) -> Result<String, ChatError> {
+            self.lifecycle.begin_delete(&self.session_dir).unwrap();
+            Ok("translated".to_owned())
+        }
+    }
+
+    fn inner_with(
+        chat: Arc<dyn ChatCompletionPort>,
+        lifecycle: Arc<SessionLifecycle>,
+    ) -> TranslationInner {
+        TranslationInner {
+            chat,
+            credentials: ProviderCredentials::default(),
+            known_sessions: Mutex::new(HashSet::new()),
+            lifecycle,
+            observer: Arc::new(|_| {}),
+            stop: AtomicBool::new(false),
+        }
+    }
+
+    fn document(endpoint: &str, auth_mode: ProviderAuthMode) -> TranslationDocument {
+        TranslationDocument {
+            auth_mode,
+            endpoint: endpoint.to_owned(),
+            model: "Hy-MT2-1.8B".to_owned(),
+            schema_version: 1,
+            segments: Vec::new(),
+            session_id: "session-1".to_owned(),
+            status: TranslationDocumentStatus::Pending,
+            target_language: "English".to_owned(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn store_with_key(directory: &Path, endpoint: &str, value: &str) -> SettingsStore {
+        let store = SettingsStore::open(directory.join("settings.json")).unwrap();
+        let defaults = AppSettings::default();
+        store
+            .save(
+                AppSettingsWithoutSecrets {
+                    audio: defaults.audio,
+                    desktop: defaults.desktop,
+                    meeting_notes: MeetingNotesSettingsWithoutSecrets {
+                        endpoint: defaults.meeting_notes.endpoint,
+                        max_input_characters: defaults.meeting_notes.max_input_characters,
+                        model: defaults.meeting_notes.model,
+                        request_timeout_seconds: defaults.meeting_notes.request_timeout_seconds,
+                    },
+                    transcription: defaults.transcription,
+                    translation: TranslationSettingsWithoutSecrets {
+                        enabled: true,
+                        endpoint: endpoint.to_owned(),
+                        model: "Hy-MT2-1.8B".to_owned(),
+                        target_language: "English".to_owned(),
+                    },
+                },
+                SettingsSecretUpdates {
+                    translation_api_key: SecretUpdate::Set {
+                        value: value.to_owned(),
+                    },
+                    ..SettingsSecretUpdates::default()
+                },
+            )
+            .unwrap();
+        store
     }
 
     #[test]
@@ -595,15 +686,15 @@ mod tests {
         let service = TranslationService::new(Arc::new(|_| {})).unwrap();
         let session = directory.path().join("session");
         fs::create_dir_all(&session).unwrap();
-        let initial = TranslationSettings {
+        let initial = TranslationSnapshot {
             endpoint: "http://127.0.0.1:9/v1".to_owned(),
             target_language: "Chinese".to_owned(),
-            ..TranslationSettings::default()
+            ..TranslationSnapshot::default()
         };
         service
             .enqueue(&session, "session-1", 1, "hello", &initial)
             .unwrap();
-        let updated = TranslationSettings {
+        let updated = TranslationSnapshot {
             model: "updated-model".to_owned(),
             target_language: "Japanese".to_owned(),
             ..initial
@@ -616,70 +707,207 @@ mod tests {
         let document = load_document(&session.join(DOCUMENT_NAME)).unwrap();
         assert_eq!(document.model, "updated-model");
         assert_eq!(document.target_language, "Japanese");
+        assert_eq!(document.auth_mode, ProviderAuthMode::None);
     }
 
     #[test]
-    fn sends_openai_compatible_translation_request() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 2_048];
-            loop {
-                let count = stream.read(&mut buffer).unwrap();
-                if count == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..count]);
-                let Some(header_end) = request.windows(4).position(|item| item == b"\r\n\r\n")
-                else {
-                    continue;
-                };
-                let headers = String::from_utf8_lossy(&request[..header_end]);
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .and_then(|value| value.trim().parse::<usize>().ok())
-                    })
-                    .unwrap();
-                if request.len() >= header_end + 4 + content_length {
-                    break;
-                }
-            }
-            let request = String::from_utf8(request).unwrap();
-            assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
-            assert!(request.contains("\"model\":\"Hy-MT2-1.8B\""));
-            assert!(request.contains("\"content\":\"你好\""));
-
-            let body = r#"{"choices":[{"message":{"content":"Hello"}}]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-        });
-        let client = Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
+    fn sends_the_task_prompt_without_credentials_when_auth_is_disabled() {
+        let chat = ScriptedChatClient::new(vec![Ok("Hello".to_owned())]);
 
         let translated = translate_text(
-            &client,
-            &format!("http://{address}/v1"),
-            "Hy-MT2-1.8B",
-            "English",
+            &chat,
+            &ProviderCredentials::default(),
+            &document("http://127.0.0.1:8000/v1", ProviderAuthMode::None),
             "你好",
         )
         .unwrap();
 
+        let requests = chat.requests();
         assert_eq!(translated, "Hello");
-        server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].api_key, None);
+        assert_eq!(requests[0].model, "Hy-MT2-1.8B");
+        assert!(requests[0].messages[0].1.contains("English"));
+        assert_eq!(requests[0].messages[1].1, "你好");
+    }
+
+    #[test]
+    fn resolves_only_the_credential_bound_to_the_task_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store_with_key(directory.path(), "https://first.example/v1", "first-key");
+        let credentials = store.credentials();
+        let chat = ScriptedChatClient::new(vec![Ok("Hello".to_owned())]);
+
+        translate_text(
+            &chat,
+            &credentials,
+            &document("https://first.example/v1", ProviderAuthMode::Bearer),
+            "你好",
+        )
+        .unwrap();
+
+        assert_eq!(chat.requests()[0].api_key.as_deref(), Some("first-key"));
+        let error = translate_text(
+            &chat,
+            &credentials,
+            &document("https://second.example/v1", ProviderAuthMode::Bearer),
+            "你好",
+        )
+        .unwrap_err();
+        assert!(matches!(error, TranslationError::ProviderChanged));
+        assert_eq!(chat.requests().len(), 1);
+    }
+
+    #[test]
+    fn refuses_to_recreate_a_deleted_session_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = directory.path().join("session");
+
+        let error = save_document(
+            &session.join(DOCUMENT_NAME),
+            &document("http://127.0.0.1:8000/v1", ProviderAuthMode::None),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, TranslationError::MissingSessionDirectory));
+        assert!(!session.exists());
+    }
+
+    #[test]
+    fn a_response_that_arrives_after_a_delete_cannot_recreate_the_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = directory.path().join("session");
+        fs::create_dir_all(&session).unwrap();
+        let lifecycle = SessionLifecycle::new();
+        let (chat, release) = GatedChatClient::new();
+        let service = TranslationService::with_chat_client(
+            Arc::new(|_| {}),
+            ProviderCredentials::default(),
+            chat.clone(),
+            lifecycle.clone(),
+        )
+        .unwrap();
+        service
+            .enqueue(
+                &session,
+                "session-1",
+                1,
+                "hello",
+                &TranslationSnapshot {
+                    enabled: true,
+                    endpoint: "http://127.0.0.1:8000/v1".to_owned(),
+                    ..TranslationSnapshot::default()
+                },
+            )
+            .unwrap();
+        chat.wait_for_request();
+
+        lifecycle.begin_delete(&session).unwrap();
+        service.forget(&session);
+        lifecycle.finish_delete(&session).unwrap();
+        release.send(()).unwrap();
+        drop(service);
+
+        assert!(!session.exists());
+        assert!(!session.join(DOCUMENT_NAME).exists());
+    }
+
+    /// The marker alone drops the result: the directory is still there, so only
+    /// the tombstone check under the lifecycle lock can refuse this write.
+    #[test]
+    fn a_marked_session_drops_a_late_translation_while_its_directory_still_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = directory.path().join("session");
+        fs::create_dir_all(&session).unwrap();
+        let lifecycle = SessionLifecycle::new();
+        let inner = inner_with(
+            Arc::new(MarkingChatClient {
+                lifecycle: lifecycle.clone(),
+                session_dir: session.clone(),
+            }),
+            lifecycle,
+        );
+        let mut pending = document("http://127.0.0.1:8000/v1", ProviderAuthMode::None);
+        pending.segments.push(TranslationSegment {
+            attempts: 0,
+            error: None,
+            segment_id: 1,
+            source_text: "你好".to_owned(),
+            status: TranslationSegmentStatus::Pending,
+            text: String::new(),
+        });
+        save_document(&session.join(DOCUMENT_NAME), &pending).unwrap();
+
+        assert!(!process_session(&inner, &session).unwrap());
+
+        let stored = load_document(&session.join(DOCUMENT_NAME)).unwrap();
+        assert_eq!(
+            stored.segments[0].status,
+            TranslationSegmentStatus::Processing
+        );
+        assert!(stored.segments[0].text.is_empty());
+    }
+
+    #[test]
+    fn a_deleting_session_is_never_enqueued_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = directory.path().join("session");
+        fs::create_dir_all(&session).unwrap();
+        let lifecycle = SessionLifecycle::new();
+        let service = TranslationService::with_chat_client(
+            Arc::new(|_| {}),
+            ProviderCredentials::default(),
+            Arc::new(ScriptedChatClient::new(Vec::new())),
+            lifecycle.clone(),
+        )
+        .unwrap();
+        lifecycle.begin_delete(&session).unwrap();
+
+        let queued = service
+            .enqueue(
+                &session,
+                "session-1",
+                1,
+                "hello",
+                &TranslationSnapshot {
+                    enabled: true,
+                    endpoint: "http://127.0.0.1:8000/v1".to_owned(),
+                    ..TranslationSnapshot::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(queued, None);
+        assert!(!session.join(DOCUMENT_NAME).exists());
+    }
+
+    #[test]
+    fn records_only_local_error_text_for_a_failed_segment() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = directory.path().join("session");
+        fs::create_dir_all(&session).unwrap();
+        let inner = inner_with(
+            Arc::new(ScriptedChatClient::new(vec![Err(ChatError::Unauthorized)])),
+            SessionLifecycle::new(),
+        );
+        let mut pending = document("http://127.0.0.1:8000/v1", ProviderAuthMode::None);
+        pending.segments.push(TranslationSegment {
+            attempts: 0,
+            error: None,
+            segment_id: 1,
+            source_text: "你好".to_owned(),
+            status: TranslationSegmentStatus::Pending,
+            text: String::new(),
+        });
+        save_document(&session.join(DOCUMENT_NAME), &pending).unwrap();
+
+        process_session(&inner, &session).unwrap();
+
+        let stored = load_document(&session.join(DOCUMENT_NAME)).unwrap();
+        assert_eq!(stored.segments[0].status, TranslationSegmentStatus::Failed);
+        assert_eq!(
+            stored.segments[0].error.as_deref(),
+            Some("chat endpoint rejected the credentials")
+        );
     }
 }

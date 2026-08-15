@@ -11,19 +11,38 @@ pub mod audio;
 pub mod capture;
 pub mod desktop;
 pub mod history;
+pub mod meeting_notes;
+pub mod meeting_notes_document;
+pub mod meeting_notes_pipeline;
 mod model_package;
 pub mod models;
+pub mod openai_compatible;
 pub mod recording;
+pub mod session_catalog;
+pub mod session_lifecycle;
 pub mod settings;
 pub mod storage;
 pub mod transcription;
 pub mod translation;
 pub mod vad;
 
-use history::{HistoryEntry, HistoryService};
+use history::{HistoryEntry, HistoryService, HistoryWorkers};
+use meeting_notes::{
+    CancelRequest, GenerateRequest, MeetingNotesService, MeetingNotesStatusEvent, RetryRequest,
+};
+use meeting_notes_document::{
+    GlobalContextContent, GlobalContextDocument, GlobalContextStore, MeetingContextContent,
+    MeetingNotesError, MeetingNotesErrorPayload, OutputLanguage, SessionAnalysisView,
+    VersionedMeetingContext,
+};
 use models::{ModelCatalogEntry, ModelDownloadStatus, ModelManager};
 use recording::{RecordingService, RecordingStatus};
-use settings::{AppSettings, AudioSourceMode, SettingsStore};
+use session_catalog::SessionCatalog;
+use session_lifecycle::SessionLifecycle;
+use settings::{
+    AppSettingsView, AppSettingsWithoutSecrets, AudioSourceMode, SettingsSecretUpdates,
+    SettingsStore,
+};
 use transcription::{
     TranscriptDocument, TranscriptSegmentUpdate, TranscriptionService, TranscriptionStatus,
 };
@@ -73,8 +92,8 @@ fn delete_recording(
 }
 
 #[tauri::command]
-fn get_settings(state: tauri::State<'_, SettingsStore>) -> AppSettings {
-    state.snapshot()
+fn get_settings(state: tauri::State<'_, SettingsStore>) -> AppSettingsView {
+    state.view()
 }
 
 #[tauri::command]
@@ -82,12 +101,106 @@ fn save_settings(
     app: tauri::AppHandle,
     state: tauri::State<'_, SettingsStore>,
     tray: tauri::State<'_, Arc<desktop::TrayController>>,
-    settings: AppSettings,
-) -> Result<AppSettings, String> {
+    settings: AppSettingsWithoutSecrets,
+    secrets: SettingsSecretUpdates,
+) -> Result<AppSettingsView, String> {
     desktop::sync_autostart(&app, settings.desktop.launch_at_login)?;
-    let saved = state.save(settings).map_err(|error| error.to_string())?;
+    let saved = state
+        .save(settings, secrets)
+        .map_err(|error| error.to_string())?;
     tray.update_language(saved.desktop.language);
     Ok(saved)
+}
+
+#[tauri::command]
+fn get_global_context(state: tauri::State<'_, Arc<GlobalContextStore>>) -> GlobalContextDocument {
+    state.document()
+}
+
+#[tauri::command]
+fn save_global_context(
+    state: tauri::State<'_, Arc<GlobalContextStore>>,
+    expected_global_context_revision: u64,
+    content: GlobalContextContent,
+) -> Result<GlobalContextDocument, MeetingNotesErrorPayload> {
+    state
+        .save(expected_global_context_revision, &content)
+        .map_err(report_meeting_notes_error)
+}
+
+#[tauri::command]
+fn save_session_context(
+    state: tauri::State<'_, Arc<SessionCatalog>>,
+    session_id: String,
+    expected_meeting_context_revision: u64,
+    content: MeetingContextContent,
+) -> Result<VersionedMeetingContext, MeetingNotesErrorPayload> {
+    let session_dir = state
+        .resolve(&session_id)
+        .map_err(|error| report_meeting_notes_error(error.into()))?;
+    meeting_notes_document::save_meeting_context(
+        &session_dir,
+        &session_id,
+        expected_meeting_context_revision,
+        &content,
+    )
+    .map_err(report_meeting_notes_error)
+}
+
+/// The payload is code-only, so the cause is logged here instead of returned.
+fn report_meeting_notes_error(error: MeetingNotesError) -> MeetingNotesErrorPayload {
+    tracing::warn!(?error, "meeting notes command failed");
+    error.payload()
+}
+
+#[tauri::command]
+fn get_session_analysis(
+    state: tauri::State<'_, Arc<MeetingNotesService>>,
+    session_id: String,
+    output_language: OutputLanguage,
+) -> Result<SessionAnalysisView, MeetingNotesErrorPayload> {
+    state
+        .load(&session_id, output_language)
+        .map_err(report_meeting_notes_error)
+}
+
+#[tauri::command]
+async fn generate_session_analysis(
+    app: tauri::AppHandle,
+    request: GenerateRequest,
+) -> Result<SessionAnalysisView, MeetingNotesErrorPayload> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Arc<MeetingNotesService>>().generate(request)
+    })
+    .await
+    .map_err(|error| report_meeting_notes_error(MeetingNotesError::io().with_source(error)))?
+    .map_err(report_meeting_notes_error)
+}
+
+#[tauri::command]
+async fn retry_session_analysis(
+    app: tauri::AppHandle,
+    request: RetryRequest,
+) -> Result<SessionAnalysisView, MeetingNotesErrorPayload> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Arc<MeetingNotesService>>().retry(request)
+    })
+    .await
+    .map_err(|error| report_meeting_notes_error(MeetingNotesError::io().with_source(error)))?
+    .map_err(report_meeting_notes_error)
+}
+
+#[tauri::command]
+async fn cancel_session_analysis(
+    app: tauri::AppHandle,
+    request: CancelRequest,
+) -> Result<SessionAnalysisView, MeetingNotesErrorPayload> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Arc<MeetingNotesService>>().cancel(request)
+    })
+    .await
+    .map_err(|error| report_meeting_notes_error(MeetingNotesError::io().with_source(error)))?
+    .map_err(report_meeting_notes_error)
 }
 
 #[tauri::command]
@@ -234,8 +347,33 @@ pub fn run() {
                 tracing::warn!(%error, "failed to synchronize launch-at-login state");
             }
             let tray = desktop::TrayController::create(app, startup_settings.desktop.language)?;
+            let credentials = settings_store.credentials();
             app.manage(settings_store);
+            let config_dir = app.path().app_config_dir()?;
+            let global_context = Arc::new(GlobalContextStore::open(
+                config_dir.join("global-context.json"),
+            )?);
+            let catalog = Arc::new(SessionCatalog::open(
+                config_dir.join(session_catalog::DOCUMENT_NAME),
+            )?);
             let recordings_root = app.path().app_local_data_dir()?.join("recordings");
+            for root in std::iter::once(&recordings_root)
+                .chain(startup_settings.audio.output_directory.as_ref())
+            {
+                if let Err(error) = catalog.register_root(root) {
+                    tracing::warn!(?error, "failed to register a recording root");
+                }
+            }
+            // Half deleted sessions go first: no recovery scan below may revive
+            // one of them or hand it back to a worker queue.
+            let lifecycle = SessionLifecycle::new();
+            match lifecycle.recover_roots(&catalog.roots()) {
+                Ok(count) if count > 0 => {
+                    tracing::info!(deleted_sessions = count, "finished interrupted deletions");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(?error, "failed to finish interrupted deletions"),
+            }
             for manifest in storage::recover_interrupted_sessions(&recordings_root)? {
                 tracing::warn!(
                     session_id = manifest.session_id,
@@ -258,7 +396,11 @@ pub fn run() {
                     tracing::debug!(?error, "translation segment event had no listener");
                 }
             });
-            let translation = Arc::new(TranslationService::new(translation_observer)?);
+            let translation = Arc::new(TranslationService::with_credentials(
+                translation_observer,
+                credentials.clone(),
+                lifecycle.clone(),
+            )?);
             let recovered_translations = translation.recover_root(&recordings_root)?;
             if recovered_translations > 0 {
                 tracing::info!(
@@ -296,6 +438,7 @@ pub fn run() {
                 transcription_observer,
                 segment_observer,
                 completion_observer,
+                lifecycle.clone(),
             ));
             let recovered_transcripts = transcription.recover_root(&recordings_root)?;
             if recovered_transcripts > 0 {
@@ -317,11 +460,38 @@ pub fn run() {
                 recording_observer,
                 Some(transcription.clone()),
                 Some(model_manager.clone()),
+                Some(catalog.clone()),
             ));
-            app.manage(HistoryService::with_transcription(
+            let meeting_notes_event_app = app.handle().clone();
+            let meeting_notes_observer = Arc::new(move |event: MeetingNotesStatusEvent| {
+                if let Err(error) = meeting_notes_event_app.emit("meeting-notes-status", event) {
+                    tracing::debug!(?error, "meeting notes status event had no listener");
+                }
+            });
+            let meeting_notes = Arc::new(MeetingNotesService::new(
+                catalog.clone(),
+                global_context.clone(),
+                lifecycle.clone(),
+                credentials,
+                meeting_notes_observer,
+            )?);
+            let recovered_analyses = meeting_notes.recover_catalog()?;
+            if recovered_analyses > 0 {
+                tracing::info!(recovered_analyses, "recovered pending meeting notes runs");
+            }
+            app.manage(HistoryService::with_workers(
                 recordings_root,
-                transcription.clone(),
+                catalog.clone(),
+                lifecycle,
+                HistoryWorkers {
+                    meeting_notes: meeting_notes.clone(),
+                    transcription: transcription.clone(),
+                    translation: translation.clone(),
+                },
             ));
+            app.manage(catalog);
+            app.manage(global_context);
+            app.manage(meeting_notes);
             app.manage(tray);
             app.manage(transcription);
             app.manage(translation);
@@ -341,10 +511,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_info,
             cancel_model_install,
+            cancel_session_analysis,
             delete_recording,
+            generate_session_analysis,
+            get_global_context,
             get_settings,
             get_model_status,
             get_recording_status,
+            get_session_analysis,
             get_session_transcript,
             get_session_translation,
             get_transcription_status,
@@ -352,6 +526,9 @@ pub fn run() {
             list_recording_history,
             list_transcription_models,
             open_recording_directory,
+            retry_session_analysis,
+            save_global_context,
+            save_session_context,
             save_settings,
             set_recording_languages,
             set_recording_source,

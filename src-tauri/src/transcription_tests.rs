@@ -27,7 +27,7 @@ fn durably_enqueues_speech_without_an_installed_model() {
             "session-1",
             &segment,
             &TranscriptionSettings::default(),
-            &TranslationSettings::default(),
+            &TranslationSnapshot::default(),
         )
         .unwrap();
     let document = load_document(&session.join(DOCUMENT_NAME)).unwrap();
@@ -61,17 +61,17 @@ fn updates_languages_for_an_active_session() {
             "session-1",
             &segment,
             &TranscriptionSettings::default(),
-            &TranslationSettings::default(),
+            &TranslationSnapshot::default(),
         )
         .unwrap();
     let transcription = TranscriptionSettings {
         language: "Japanese".to_owned(),
         ..TranscriptionSettings::default()
     };
-    let translation = TranslationSettings {
+    let translation = TranslationSnapshot {
         enabled: false,
         target_language: "English".to_owned(),
-        ..TranslationSettings::default()
+        ..TranslationSnapshot::default()
     };
 
     service
@@ -109,7 +109,7 @@ fn notifies_segment_observer_when_speech_is_enqueued() {
             "session-1",
             &segment,
             &TranscriptionSettings::default(),
-            &TranslationSettings::default(),
+            &TranslationSnapshot::default(),
         )
         .unwrap();
 
@@ -184,7 +184,7 @@ fn recovery_returns_processing_segments_to_pending() {
         session_id: "session-1".to_owned(),
         status: TranscriptDocumentStatus::Processing,
         threads: 2,
-        translation: TranslationSettings::default(),
+        translation: TranslationSnapshot::default(),
         unload_after_idle_minutes: 10,
         updated_at: Utc::now(),
     };
@@ -200,7 +200,33 @@ fn recovery_returns_processing_segments_to_pending() {
 }
 
 #[test]
-fn deleting_a_session_removes_its_pending_queue_count() {
+fn a_late_transcript_save_cannot_recreate_a_deleted_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = directory.path().join("session");
+    fs::create_dir_all(&session).unwrap();
+    let document = TranscriptDocument {
+        forced_language: "auto".to_owned(),
+        model_id: "qwen3-asr-0.6b-int8".to_owned(),
+        schema_version: 1,
+        segments: Vec::new(),
+        session_id: "session-1".to_owned(),
+        status: TranscriptDocumentStatus::Pending,
+        threads: 2,
+        translation: TranslationSnapshot::default(),
+        unload_after_idle_minutes: 10,
+        updated_at: Utc::now(),
+    };
+    save_document(&session.join(DOCUMENT_NAME), &document).unwrap();
+    fs::remove_dir_all(&session).unwrap();
+
+    let error = save_document(&session.join(DOCUMENT_NAME), &document).unwrap_err();
+
+    assert!(matches!(error, TranscriptionError::MissingSessionDirectory));
+    assert!(!session.exists());
+}
+
+#[test]
+fn forgetting_a_session_removes_its_pending_queue_count() {
     let directory = tempfile::tempdir().unwrap();
     let manager = Arc::new(ModelManager::new(directory.path().join("models")).unwrap());
     let service = TranscriptionService::new(manager);
@@ -218,15 +244,76 @@ fn deleting_a_session_removes_its_pending_queue_count() {
             "session-1",
             &segment,
             &TranscriptionSettings::default(),
-            &TranslationSettings::default(),
+            &TranslationSnapshot::default(),
         )
         .unwrap();
     assert_eq!(service.status().pending_segments, 1);
 
-    service.delete_session_directory(&session).unwrap();
+    service.forget_session(&session);
 
-    assert!(!session.exists());
+    assert!(
+        session.exists(),
+        "removing the directory is the caller's job"
+    );
     assert_eq!(service.status().pending_segments, 0);
+}
+
+#[test]
+fn persisted_transcripts_carry_a_secret_free_translation_snapshot() {
+    let mut settings = crate::settings::AppSettings::default();
+    settings.translation.endpoint = "https://provider.example/v1".to_owned();
+    settings.translation.api_key = crate::settings::SecretString::new("top-secret-key".to_owned());
+    settings.translation.api_key_endpoint =
+        crate::openai_compatible::chat_completions_url(&settings.translation.endpoint)
+            .unwrap()
+            .to_string();
+    let document = TranscriptDocument {
+        forced_language: "auto".to_owned(),
+        model_id: "qwen3-asr-0.6b-int8".to_owned(),
+        schema_version: 1,
+        segments: Vec::new(),
+        session_id: "session-1".to_owned(),
+        status: TranscriptDocumentStatus::Complete,
+        threads: 2,
+        translation: settings.translation.snapshot(),
+        unload_after_idle_minutes: 10,
+        updated_at: Utc::now(),
+    };
+
+    let serialized = serde_json::to_string(&document).unwrap();
+
+    assert!(!serialized.contains("top-secret-key"));
+    assert!(serialized.contains("\"authMode\":\"bearer\""));
+    assert!(!serialized.contains("apiKey"));
+}
+
+#[test]
+fn reads_older_transcripts_without_an_auth_mode() {
+    let mut value = serde_json::to_value(TranscriptDocument {
+        forced_language: "auto".to_owned(),
+        model_id: "qwen3-asr-0.6b-int8".to_owned(),
+        schema_version: 1,
+        segments: Vec::new(),
+        session_id: "session-1".to_owned(),
+        status: TranscriptDocumentStatus::Complete,
+        threads: 2,
+        translation: TranslationSnapshot::default(),
+        unload_after_idle_minutes: 10,
+        updated_at: Utc::now(),
+    })
+    .unwrap();
+    value
+        .get_mut("translation")
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap()
+        .remove("authMode");
+
+    let document: TranscriptDocument = serde_json::from_value(value).unwrap();
+
+    assert_eq!(
+        document.translation.auth_mode,
+        crate::settings::ProviderAuthMode::None
+    );
 }
 
 #[test]

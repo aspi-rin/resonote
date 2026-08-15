@@ -12,6 +12,7 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::{
+    meeting_notes::MeetingNotesService,
     recording::{RecordingPhase, RecordingService, RecordingStatus},
     settings::{AppLanguage, SettingsStore},
 };
@@ -121,8 +122,11 @@ pub fn handle_run_event(app: &AppHandle, event: tauri::RunEvent) {
     if let tauri::RunEvent::Reopen { .. } = event {
         show_main_window(app);
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = (app, event);
+    if let tauri::RunEvent::Exit = event {
+        if let Some(service) = app.try_state::<Arc<MeetingNotesService>>() {
+            service.shutdown();
+        }
+    }
 }
 
 pub fn sync_autostart(app: &AppHandle, enabled: bool) -> Result<bool, String> {
