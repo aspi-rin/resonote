@@ -9,6 +9,7 @@ use tauri::{Emitter, Manager};
 pub mod asr;
 pub mod audio;
 pub mod capture;
+pub mod context_extraction;
 pub mod desktop;
 pub mod history;
 pub mod meeting_notes;
@@ -27,6 +28,7 @@ pub mod transcription;
 pub mod translation;
 pub mod vad;
 
+use context_extraction::ExtractContextRequest;
 use history::{HistoryEntry, HistoryService, HistoryWorkers};
 use meeting_notes::{
     CancelRequest, GenerateRequest, MeetingNotesService, MeetingNotesStatusEvent, RetryRequest,
@@ -181,6 +183,46 @@ fn save_session_context(
         expected_meeting_context_revision,
         &content,
     )
+    .map_err(report_meeting_notes_error)
+}
+
+/// Fills the global template from reference text with the configured chat
+/// model. The draft is only returned: merging and saving stay the user's call.
+#[tauri::command]
+async fn extract_global_context_draft(
+    app: tauri::AppHandle,
+    request: ExtractContextRequest,
+) -> Result<GlobalContextContent, MeetingNotesErrorPayload> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let chat =
+            ReqwestChatClient::new().map_err(|error| MeetingNotesError::io().with_source(error))?;
+        context_extraction::extract_global_context_draft(
+            &app.state::<SettingsStore>(),
+            &chat,
+            request,
+        )
+    })
+    .await
+    .map_err(|error| report_meeting_notes_error(MeetingNotesError::io().with_source(error)))?
+    .map_err(report_meeting_notes_error)
+}
+
+#[tauri::command]
+async fn extract_meeting_context_draft(
+    app: tauri::AppHandle,
+    request: ExtractContextRequest,
+) -> Result<MeetingContextContent, MeetingNotesErrorPayload> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let chat =
+            ReqwestChatClient::new().map_err(|error| MeetingNotesError::io().with_source(error))?;
+        context_extraction::extract_meeting_context_draft(
+            &app.state::<SettingsStore>(),
+            &chat,
+            request,
+        )
+    })
+    .await
+    .map_err(|error| report_meeting_notes_error(MeetingNotesError::io().with_source(error)))?
     .map_err(report_meeting_notes_error)
 }
 
@@ -550,6 +592,8 @@ pub fn run() {
             cancel_model_install,
             cancel_session_analysis,
             delete_recording,
+            extract_global_context_draft,
+            extract_meeting_context_draft,
             generate_session_analysis,
             get_global_context,
             get_settings,

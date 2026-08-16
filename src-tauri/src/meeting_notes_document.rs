@@ -867,6 +867,7 @@ pub enum MeetingNotesErrorCode {
     TranscriptInvalid,
     NoTranscriptContent,
     PartialConfirmationRequired,
+    ContextDraftInvalid,
     ContextRevisionConflict,
     ContextTooLarge,
     ProviderChanged,
@@ -903,6 +904,7 @@ impl MeetingNotesErrorCode {
             Self::TranscriptInvalid => "TRANSCRIPT_INVALID",
             Self::NoTranscriptContent => "NO_TRANSCRIPT_CONTENT",
             Self::PartialConfirmationRequired => "PARTIAL_CONFIRMATION_REQUIRED",
+            Self::ContextDraftInvalid => "CONTEXT_DRAFT_INVALID",
             Self::ContextRevisionConflict => "CONTEXT_REVISION_CONFLICT",
             Self::ContextTooLarge => "CONTEXT_TOO_LARGE",
             Self::ProviderChanged => "PROVIDER_CHANGED",
@@ -940,7 +942,8 @@ impl MeetingNotesErrorCode {
     pub fn retryable(self) -> bool {
         matches!(
             self,
-            Self::IoError
+            Self::ContextDraftInvalid
+                | Self::IoError
                 | Self::ProviderRateLimited
                 | Self::ProviderResponseInvalid
                 | Self::ProviderTimeout

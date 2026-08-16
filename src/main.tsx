@@ -60,6 +60,7 @@ import {
   type MeetingNotesStatusEvent,
   type ModelCatalogEntry,
   type ModelDownloadStatus,
+  type OutputLanguage,
   type ProviderKind,
   type RecordingStatus,
   type SecretUpdate,
@@ -775,7 +776,6 @@ export function App() {
           <NavButton active={tab === "history"} icon="history" label={t("history")} onClick={() => { setTab("history"); void refreshHistory(); }} />
           <NavButton active={tab === "settings"} icon="gear" label={t("settings")} onClick={() => setTab("settings")} />
         </nav>
-        <div class="privacy-note"><Icon name="shield" /><div><strong>{t("localOnly")}</strong><p>{t("localOnlyHint")}</p></div></div>
         <span class="version">{t("version")} {version}</span>
       </aside>
 
@@ -790,7 +790,7 @@ export function App() {
 
           {tab === "record" && <RecordView t={t} settings={settings} recording={recording} transcription={transcription} model={model} liveSegments={liveTranscript.segments} liveTranslations={liveTranscript.translations} busy={busy} isActive={isActive} changeLanguages={changeRecordingLanguages} changeSource={changeAudioSource} start={startRecording} stop={stopRecording} />}
           {tab === "history" && <HistoryView t={t} locale={locale} history={history} analyses={analyses} analysisBusy={analysisBusy} analysisErrors={analysisErrors} analysisStatuses={analysisStatuses} expanded={expanded} globalContext={globalContext.content} settings={settings} cancel={(sessionId) => controlRun(sessionId, "cancel_session_analysis")} generate={generateAnalysis} openSettings={() => setTab("settings")} retry={(sessionId) => controlRun(sessionId, "retry_session_analysis")} saveContext={(sessionId, content) => void saveMeetingContext(sessionId, content)} toggle={toggleSession} refresh={() => void refreshHistory()} open={(sessionId) => void invoke("open_recording_directory", { sessionId }).catch((reason) => setError(String(reason)))} remove={(sessionId) => void deleteRecording(sessionId)} />}
-          {tab === "settings" && <SettingsView t={t} settings={settings} models={models} busy={busy || isActive} modelTransitioning={modelTransitioning} saved={saved} update={update} model={model} selectModel={(modelId) => void selectModel(modelId)} installModel={installModel} cancelModel={() => void cancelModel()} chooseOutputDirectory={() => void chooseOutputDirectory()} globalContext={globalDraft} globalNotice={globalNotice} globalRevision={globalContext.revision} saveGlobalContext={() => void saveGlobalContext()} providerFetch={{ errors: fetchErrors, fetch: (provider) => void fetchProviderModels(provider), models: fetchedModels, running: fetchingModels }} providerKeys={{ blocked, focus: focusApiKey, secrets, update: updateApiKey, values: apiKeys }} providerTest={{ confirmed, errors: testErrors, running: testing, test: (provider) => void testProvider(provider) }} updateGlobalContext={setGlobalDraft} />}
+          {tab === "settings" && <SettingsView t={t} locale={locale} settings={settings} models={models} busy={busy || isActive} modelTransitioning={modelTransitioning} saved={saved} update={update} model={model} selectModel={(modelId) => void selectModel(modelId)} installModel={installModel} cancelModel={() => void cancelModel()} chooseOutputDirectory={() => void chooseOutputDirectory()} globalContext={globalDraft} globalNotice={globalNotice} globalRevision={globalContext.revision} saveGlobalContext={() => void saveGlobalContext()} providerFetch={{ errors: fetchErrors, fetch: (provider) => void fetchProviderModels(provider), models: fetchedModels, running: fetchingModels }} providerKeys={{ blocked, focus: focusApiKey, secrets, update: updateApiKey, values: apiKeys }} providerTest={{ confirmed, errors: testErrors, running: testing, test: (provider) => void testProvider(provider) }} updateGlobalContext={setGlobalDraft} />}
         </div>
       </main>
     </div>
@@ -918,7 +918,7 @@ function TranscriptionBadge({ t, status, model }: ViewProps & { status: Transcri
 }
 
 export function HistoryView({ t, locale, history, analyses, analysisBusy, analysisErrors, analysisStatuses, expanded, globalContext, settings, cancel, generate, openSettings, retry, saveContext, toggle, refresh, open, remove }: ViewProps & {
-  locale: string; history: HistoryEntry[]; analyses: Record<string, SessionAnalysisView>; analysisBusy: string | null; analysisErrors: Record<string, unknown>; analysisStatuses: Record<string, AnalysisStatus>; expanded: string | null; globalContext: GlobalContextContent; settings: AppSettings;
+  locale: OutputLanguage; history: HistoryEntry[]; analyses: Record<string, SessionAnalysisView>; analysisBusy: string | null; analysisErrors: Record<string, unknown>; analysisStatuses: Record<string, AnalysisStatus>; expanded: string | null; globalContext: GlobalContextContent; settings: AppSettings;
   cancel: (id: string) => void; generate: (id: string, content: MeetingContextContent, options: { acceptPartial: boolean; mode: GenerateMode }) => void; openSettings: () => void; retry: (id: string) => void; saveContext: (id: string, content: MeetingContextContent) => void; toggle: (id: string) => void; refresh: () => void; open: (id: string) => void; remove: (id: string) => void;
 }) {
   return <div class="view-stack"><div class="view-actions"><p>{history.length} {t("history").toLowerCase()}</p><button class="icon-button" onClick={refresh}><Icon name="refresh" />{t("refresh")}</button></div>
@@ -929,8 +929,8 @@ export function HistoryView({ t, locale, history, analyses, analysisBusy, analys
   </div>;
 }
 
-export function SettingsView({ t, settings, models, busy, modelTransitioning, saved, update, model, selectModel, installModel, cancelModel, chooseOutputDirectory, globalContext, globalNotice, globalRevision, saveGlobalContext, providerFetch, providerKeys, providerTest, updateGlobalContext }: ViewProps & {
-  settings: AppSettings; models: ModelCatalogEntry[]; busy: boolean; modelTransitioning: boolean; saved: boolean; update: (mutate: (next: AppSettings) => void) => void; model: ModelDownloadStatus; selectModel: (modelId: string) => void; installModel: () => void; cancelModel: () => void; chooseOutputDirectory: () => void;
+export function SettingsView({ t, locale, settings, models, busy, modelTransitioning, saved, update, model, selectModel, installModel, cancelModel, chooseOutputDirectory, globalContext, globalNotice, globalRevision, saveGlobalContext, providerFetch, providerKeys, providerTest, updateGlobalContext }: ViewProps & {
+  locale: OutputLanguage; settings: AppSettings; models: ModelCatalogEntry[]; busy: boolean; modelTransitioning: boolean; saved: boolean; update: (mutate: (next: AppSettings) => void) => void; model: ModelDownloadStatus; selectModel: (modelId: string) => void; installModel: () => void; cancelModel: () => void; chooseOutputDirectory: () => void;
   globalContext: GlobalContextContent; globalNotice: string | null; globalRevision: number; saveGlobalContext: () => void; providerFetch: ProviderFetchProps; providerKeys: ProviderKeyProps; providerTest: ProviderTestProps; updateGlobalContext: (content: GlobalContextContent) => void;
 }) {
   const anyBlocked = providerKeys.blocked.meetingNotes || providerKeys.blocked.translation;
@@ -961,7 +961,7 @@ export function SettingsView({ t, settings, models, busy, modelTransitioning, sa
 
     <MeetingNotesProviderSection action={providerAction("meetingNotes")} blocked={providerKeys.blocked.meetingNotes} fetch={providerFetch} fetchBlocked={fetchBlocked(providerKeys.blocked.meetingNotes)} keys={providerKeys} settings={settings} status={providerStatus("meetingNotes")} t={t} update={update} />
 
-    <GlobalContextSection busy={busy} content={globalContext} notice={globalNotice} revision={globalRevision} save={saveGlobalContext} t={t} onChange={updateGlobalContext} />
+    <GlobalContextSection busy={busy} content={globalContext} locale={locale} notice={globalNotice} revision={globalRevision} save={saveGlobalContext} t={t} onChange={updateGlobalContext} />
 
     <SettingsSection icon="gear" title={t("desktop")}><Toggle label={t("hideOnClose")} checked={settings.desktop.hideWindowOnClose} onChange={(checked) => update((next) => { next.desktop.hideWindowOnClose = checked; })} /><Toggle label={t("launchAtLogin")} checked={settings.desktop.launchAtLogin} onChange={(checked) => update((next) => { next.desktop.launchAtLogin = checked; })} /><Toggle label={t("recordOnLaunch")} checked={settings.desktop.startRecordingOnLaunch} onChange={(checked) => update((next) => { next.desktop.startRecordingOnLaunch = checked; })} /></SettingsSection>
 

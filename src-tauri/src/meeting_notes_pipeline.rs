@@ -34,7 +34,8 @@ pub use chunking::{
     measure_request, plan_clean_chunks, plan_reduce_groups, plan_summary,
 };
 pub use parsing::{
-    parse_clean_response, parse_summary_response, reassemble_clean_result, resolve_context_pointer,
+    json_payload, parse_clean_response, parse_summary_response, reassemble_clean_result,
+    resolve_context_pointer,
 };
 pub use prompts::{
     CLEAN_PROMPT_VERSION, CLEAN_SYSTEM_PROMPT, SUMMARY_MAP_PROMPT_VERSION, SUMMARY_PROMPT_VERSION,

@@ -529,6 +529,7 @@ fn serializes_every_stable_error_code_exactly_once() {
         MeetingNotesErrorCode::TranscriptInvalid,
         MeetingNotesErrorCode::NoTranscriptContent,
         MeetingNotesErrorCode::PartialConfirmationRequired,
+        MeetingNotesErrorCode::ContextDraftInvalid,
         MeetingNotesErrorCode::ContextRevisionConflict,
         MeetingNotesErrorCode::ContextTooLarge,
         MeetingNotesErrorCode::ProviderChanged,
@@ -554,14 +555,14 @@ fn serializes_every_stable_error_code_exactly_once() {
         .map(|code| serde_json::to_string(code).unwrap())
         .collect::<Vec<_>>();
 
-    assert_eq!(codes.len(), 31);
+    assert_eq!(codes.len(), 32);
     assert_eq!(
         serialized
             .iter()
             .map(|value| value.trim_matches('"').to_owned())
             .collect::<HashSet<_>>()
             .len(),
-        31
+        32
     );
     for (code, value) in codes.iter().zip(&serialized) {
         assert_eq!(value.trim_matches('"'), code.as_str());

@@ -26,6 +26,7 @@ const ERROR_CODES = [
   "TRANSCRIPT_INVALID",
   "NO_TRANSCRIPT_CONTENT",
   "PARTIAL_CONFIRMATION_REQUIRED",
+  "CONTEXT_DRAFT_INVALID",
   "CONTEXT_REVISION_CONFLICT",
   "CONTEXT_TOO_LARGE",
   "PROVIDER_CHANGED",
@@ -139,7 +140,7 @@ describe("translation dictionaries", () => {
   });
 
   it("localizes every meeting-notes error code in both languages", () => {
-    expect(ERROR_CODES).toHaveLength(31);
+    expect(ERROR_CODES).toHaveLength(32);
     for (const code of ERROR_CODES) {
       const key = messageKeyFor(code);
       expect(dictionaries["zh-CN"][key], code).toBeTruthy();

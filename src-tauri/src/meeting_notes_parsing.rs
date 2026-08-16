@@ -126,7 +126,9 @@ pub fn resolve_context_pointer<'a>(context: &'a Value, pointer: &str) -> Option<
     Some(current)
 }
 
-fn json_payload(body: &str) -> Option<&str> {
+/// The one place a model reply is unwrapped: bare JSON or exactly one Markdown
+/// JSON fence, and nothing else.
+pub fn json_payload(body: &str) -> Option<&str> {
     let trimmed = body.trim();
     let Some(fenced) = trimmed.strip_prefix("```") else {
         return Some(trimmed);

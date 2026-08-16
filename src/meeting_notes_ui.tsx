@@ -17,9 +17,11 @@ import {
   type GlossaryEntry,
   type HistoryEntry,
   type MeetingContextContent,
+  type MeetingNotesErrorCode,
   type MeetingNotesErrorPayload,
   type MeetingNotesStatusEvent,
   type MeetingSummary,
+  type OutputLanguage,
   type ParticipantContext,
   type ProviderKind,
   type ProviderSettingsView,
@@ -397,14 +399,138 @@ export function MeetingNotesProviderSection({ action, blocked, fetch, fetchBlock
   </SettingsSection>;
 }
 
-export function GlobalContextSection({ busy, content, notice, onChange, revision, save, t }: { busy: boolean; content: GlobalContextContent; notice: string | null; onChange: (content: GlobalContextContent) => void; revision: number; save: () => void; t: Translate }) {
+export function GlobalContextSection({ busy, content, locale, notice, onChange, revision, save, t }: { busy: boolean; content: GlobalContextContent; locale: OutputLanguage; notice: string | null; onChange: (content: GlobalContextContent) => void; revision: number; save: () => void; t: Translate }) {
   const characters = contextCharacterCount(content);
   return <SettingsSection icon="book" title={t("globalContext")} action={<span class="context-count">{format(t("contextCharacters"), { characters, limit: CONTEXT_CHARACTER_LIMIT })}</span>}>
     <p class="section-note">{t("globalContextHint")}</p>
     {notice && <p class="inline-warning" role="alert">{notice}</p>}
     <ContextEditor kind="global" t={t} value={content} onChange={onChange} />
-    <div class="context-actions"><span class="context-revision">r{revision}</span><button class="secondary-button accent" disabled={busy || characters > CONTEXT_CHARACTER_LIMIT} type="button" onClick={save}>{t("saveGlobalContext")}</button></div>
+    <div class="context-actions">
+      <span class="context-revision">r{revision}</span>
+      <ExtractContextPanel busy={busy} kind="global" locale={locale} t={t} value={content} onChange={onChange} />
+      <button class="secondary-button accent" disabled={busy || characters > CONTEXT_CHARACTER_LIMIT} type="button" onClick={save}>{t("saveGlobalContext")}</button>
+    </div>
   </SettingsSection>;
+}
+
+/** Additive by construction: a scalar the user already filled is never
+ *  overwritten, a list only gains names it does not carry yet, and the free text
+ *  grows by one block. Nothing here saves — the editor keeps the draft. */
+export function mergeContextDraft<T extends GlobalContextContent | MeetingContextContent>(current: T, draft: T): T {
+  return mergeRecord(current as unknown as ContextRecord, draft as unknown as ContextRecord) as unknown as T;
+}
+
+type ContextRecord = Record<string, unknown>;
+
+function mergeRecord(current: ContextRecord, draft: ContextRecord): ContextRecord {
+  const merged: ContextRecord = { ...current };
+  for (const [key, value] of Object.entries(draft)) merged[key] = key === "freeText" ? appendBlock(String(current[key] ?? ""), String(value ?? "")) : mergeField(current[key], value);
+  return merged;
+}
+
+function mergeField(current: unknown, draft: unknown): unknown {
+  if (Array.isArray(current) && Array.isArray(draft)) return mergeList(current, draft);
+  if (typeof current === "string") return current.trim() === "" ? draft : current;
+  if (isContextRecord(current) && isContextRecord(draft)) return mergeRecord(current, draft);
+  return current ?? draft;
+}
+
+function mergeList(current: unknown[], draft: unknown[]) {
+  const seen = new Set(current.map(entryName));
+  return [...current, ...draft.filter((entry) => { const name = entryName(entry); if (seen.has(name)) return false; seen.add(name); return true; })];
+}
+
+function entryName(entry: unknown) {
+  if (typeof entry === "string") return entry.trim().toLowerCase();
+  const record = isContextRecord(entry) ? entry : {};
+  return String(record.canonicalName ?? record.term ?? "").trim().toLowerCase();
+}
+
+function appendBlock(current: string, draft: string) {
+  const addition = draft.trim();
+  if (addition === "") return current;
+  return current.trim() === "" ? addition : `${current}\n\n${addition}`;
+}
+
+function isContextRecord(value: unknown): value is ContextRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export type ExtractContextPanelProps = ContextEditorProps & { busy: boolean; locale: OutputLanguage; openSettings?: () => void };
+
+interface PickedFile { characters: number; name: string; text: string }
+
+const MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024;
+
+export function joinDraftSources(text: string, files: PickedFile[]) {
+  return files.reduce((joined, file) => `${joined}\n\n--- ${file.name} ---\n\n${file.text}`, text).trim();
+}
+
+/** Carries the editor props it feeds, so both context layers get the panel by
+ *  handing it the value and setter they already own. */
+export function ExtractContextPanel(props: ExtractContextPanelProps) {
+  const { busy, locale, openSettings, t } = props;
+  const [applied, setApplied] = useState(false);
+  const [error, setError] = useState<{ code: MeetingNotesErrorCode | null; message: string } | null>(null);
+  const [extracting, setExtracting] = useState(false);
+  const [files, setFiles] = useState<PickedFile[]>([]);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const payload = joinDraftSources(text, files);
+
+  const pick = (input: HTMLInputElement) => {
+    setFileError(null);
+    for (const file of Array.from(input.files ?? [])) {
+      if (file.size > MAX_TEXT_FILE_BYTES) { setFileError(format(t("fileTooLarge"), { name: file.name })); continue; }
+      const reader = new FileReader();
+      reader.onload = () => { const content = String(reader.result ?? ""); setFiles((current) => [...current, { characters: [...content].length, name: file.name, text: content }]); };
+      reader.readAsText(file, "utf-8");
+    }
+    input.value = "";
+  };
+
+  // The draft is merged into the editor, never saved: the user reviews it first.
+  const extract = async () => {
+    if (!isTauri || payload === "") return;
+    setError(null);
+    setExtracting(true);
+    try {
+      const request = { outputLanguage: locale, text: payload };
+      if (props.kind === "global") props.onChange(mergeContextDraft(props.value, await invoke<GlobalContextContent>("extract_global_context_draft", { request })));
+      else props.onChange(mergeContextDraft(props.value, await invoke<MeetingContextContent>("extract_meeting_context_draft", { request })));
+      setApplied(true);
+      setFiles([]);
+      setOpen(false);
+      setText("");
+    } catch (reason) {
+      setError({ code: parseMeetingNotesError(reason)?.code ?? null, message: describeError(t, reason) });
+    } finally {
+      setExtracting(false);
+    }
+  };
+
+  return <>
+    {applied && <span class="context-notice">{t("contextDraftApplied")}</span>}
+    <button aria-expanded={open} class="secondary-button" disabled={busy} type="button" onClick={() => { setApplied(false); setOpen(!open); }}>{t("extractFromText")}</button>
+    {open && <div class="confirm-panel extract-panel">
+      <label class="field context-textarea"><span>{t("extractContextTitle")}</span><textarea placeholder={t("pasteTextPlaceholder")} rows={4} value={text} onInput={(event) => setText(event.currentTarget.value)} /></label>
+      <label class="field extract-file-field"><span>{t("chooseTextFiles")}</span><input accept=".txt,.md,.markdown,text/plain" multiple type="file" onChange={(event) => pick(event.currentTarget)} /></label>
+      {files.length > 0 && <ul class="extract-files">{files.map((file, index) => <li class="extract-file" key={`${file.name}-${index}`}>
+        <span>{file.name}</span>
+        <span class="context-count">{format(t("contextFileCharacters"), { characters: file.characters })}</span>
+        <button class="row-button remove" title={t("listRemove")} type="button" onClick={() => setFiles(removeAt(files, index))}>×</button>
+      </li>)}</ul>}
+      {fileError && <p class="inline-warning" role="alert">{fileError}</p>}
+      {extracting && <p class="extract-status">{t("extracting")}</p>}
+      {error && <p class="run-error" role="alert">{error.message}</p>}
+      <div class="confirm-actions">
+        {error?.code === "MEETING_NOTES_NOT_CONFIGURED" && openSettings && <button class="secondary-button" type="button" onClick={openSettings}>{t("openMeetingNotesSettings")}</button>}
+        <button class="secondary-button" type="button" onClick={() => setOpen(false)}>{t("cancel")}</button>
+        <button class="secondary-button accent" disabled={busy || extracting || payload === ""} type="button" onClick={() => void extract()}>{t("extractContextRun")}</button>
+      </div>
+    </div>}
+  </>;
 }
 
 export type ContextEditorProps =
@@ -706,7 +832,7 @@ export function MeetingNotesDetail({ analysis, busy, cancel, entry, error, gener
   error: unknown;
   generate: (content: MeetingContextContent, options: { acceptPartial: boolean; mode: GenerateMode }) => void;
   globalContext: GlobalContextContent;
-  locale: string;
+  locale: OutputLanguage;
   openSettings: () => void;
   retry: () => void;
   saveContext: (content: MeetingContextContent) => void;
@@ -788,7 +914,11 @@ export function MeetingNotesDetail({ analysis, busy, cancel, entry, error, gener
           <div class="detail-block-head"><h3>{t("meetingContext")}</h3><span class="context-count">{format(t("contextCharacters"), { characters: contextCharacterCount(draft), limit: CONTEXT_CHARACTER_LIMIT })}</span></div>
           <p class="context-hint">{t("meetingContextHint")}</p>
           <ContextEditor kind="meeting" t={t} value={draft} onChange={setDraft} />
-          <div class="context-actions"><span class="context-revision">r{revision}</span><button class="secondary-button accent" disabled={busy} type="button" onClick={() => saveContext(draft)}>{t("saveMeetingContext")}</button></div>
+          <div class="context-actions">
+            <span class="context-revision">r{revision}</span>
+            <ExtractContextPanel busy={busy} kind="meeting" locale={locale} openSettings={openSettings} t={t} value={draft} onChange={setDraft} />
+            <button class="secondary-button accent" disabled={busy} type="button" onClick={() => saveContext(draft)}>{t("saveMeetingContext")}</button>
+          </div>
         </div>
         <div class="context-block">
           <div class="detail-block-head"><h3>{t("contextCurrentGlobal")}</h3></div>
