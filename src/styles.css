@@ -132,8 +132,12 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
 .model-action-button { position: relative; display: inline-flex; min-width: 0; min-height: 40px; max-width: 58%; align-items: center; padding: 0 12px 0 14px; overflow: hidden; border: 1px solid var(--blue); border-radius: 10px; color: white; background: var(--blue); box-shadow: 0 5px 14px color-mix(in srgb, var(--blue) 16%, transparent); font-size: 10px; font-weight: 700; white-space: nowrap; transition-property: scale, color, background-color, border-color, box-shadow; transition-duration: 150ms; transition-timing-function: ease-out; }
 .model-action-button:not(:disabled):hover { box-shadow: 0 7px 18px color-mix(in srgb, var(--blue) 23%, transparent); }
 .model-action-button:not(:disabled):active { scale: 0.96; }
-.model-action-button.downloading { color: var(--blue); background: var(--panel-raised); box-shadow: none; }
-.model-action-button.downloaded { border-color: color-mix(in srgb, var(--green) 35%, transparent); color: var(--green); background: color-mix(in srgb, var(--green) 9%, var(--panel-raised)); box-shadow: none; cursor: default; opacity: 1; }
+.model-action-button.downloading, .provider-action-button.testing { color: var(--blue); background: var(--panel-raised); box-shadow: none; }
+.model-action-button.downloaded, .provider-action-button.verified { border-color: color-mix(in srgb, var(--green) 35%, transparent); color: var(--green); background: color-mix(in srgb, var(--green) 9%, var(--panel-raised)); box-shadow: none; cursor: default; opacity: 1; }
+.provider-action-button.testing { cursor: progress; opacity: 1; }
+.provider-action-button.testing .model-action-icon-state.active { animation: breathe 1.4s infinite; }
+.provider-action-button.failed { border-color: var(--red); background: var(--red); box-shadow: 0 5px 14px color-mix(in srgb, var(--red) 16%, transparent); }
+.provider-action-button.failed:not(:disabled):hover { box-shadow: 0 7px 18px color-mix(in srgb, var(--red) 23%, transparent); }
 .model-action-progress { position: absolute; inset: 0 auto 0 0; background: color-mix(in srgb, var(--blue) 14%, transparent); pointer-events: none; transition: width 120ms linear; }
 .model-action-content { position: relative; z-index: 1; display: inline-flex; min-width: 0; align-items: center; gap: 7px; font-variant-numeric: tabular-nums; }
 .model-action-content > span:last-child { overflow: hidden; text-overflow: ellipsis; }
@@ -234,7 +238,8 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
 .inline-warning { margin: 0; padding: 9px 11px; border: 1px solid color-mix(in srgb, #d3a63a 40%, transparent); border-radius: 9px; color: #96701a; background: color-mix(in srgb, #d3a63a 10%, transparent); font-size: 10px; line-height: 1.6; text-wrap: pretty; }
 .inline-warning.blocking { border-color: color-mix(in srgb, var(--red) 32%, transparent); color: var(--red); background: color-mix(in srgb, var(--red) 8%, transparent); }
 .api-key-field .api-key-row { position: relative; display: flex; }
-.api-key-field .api-key-row input { min-width: 0; flex: 1 1 auto; padding-right: 42px; }
+.api-key-field .api-key-row input { min-width: 0; flex: 1 1 auto; }
+.api-key-field .api-key-row.has-reveal input { padding-right: 42px; }
 .api-key-reveal { position: absolute; top: 50%; right: 4px; display: grid; width: 32px; height: 32px; place-items: center; transform: translateY(-50%); border-radius: 9px; color: var(--muted); background: transparent; }
 .api-key-reveal:hover { color: var(--blue); background: var(--blue-soft); }
 .api-key-reveal .icon { width: 16px; height: 16px; }
@@ -246,11 +251,8 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
 .model-refresh .icon { width: 15px; height: 15px; }
 .model-note { margin: 0; color: var(--muted); font-size: 9px; font-weight: 700; line-height: 1.5; text-wrap: pretty; }
 .model-note.failed { color: var(--red); }
-.provider-status { display: flex; align-items: center; gap: 11px; flex-wrap: wrap; }
-.provider-status .icon-button { flex: 0 0 auto; white-space: nowrap; }
 .provider-status-note { display: inline-flex; align-items: center; gap: 6px; min-width: 0; margin: 0; color: var(--faint); font-size: 10px; font-weight: 700; line-height: 1.5; text-wrap: pretty; }
 .provider-status-note i { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: currentColor; }
-.provider-status-note.verified { color: var(--green); }
 .provider-status-note.failed { color: var(--red); }
 .advanced-settings { border: 1px solid var(--line); border-radius: 10px; background: color-mix(in srgb, var(--ink) 2%, transparent); }
 .advanced-settings summary { padding: 10px 12px; color: var(--muted); font-size: 10px; font-weight: 700; cursor: pointer; }

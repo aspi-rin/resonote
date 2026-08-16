@@ -48,8 +48,16 @@ function testedPayload() {
   return call.args.request as TestProviderSettingsRequest;
 }
 
-function testButton(section: HTMLElement) {
-  return within(section).getByRole("button", { name: t("providerTestConnection") }) as HTMLButtonElement;
+/** The section-header pill, found by class because its label is the state. */
+function testPill(section: HTMLElement) {
+  const pill = section.querySelector<HTMLButtonElement>("button.provider-action-button");
+  if (!pill) throw new Error("provider test pill not found");
+  return pill;
+}
+
+/** Present only while a new key is being typed, whichever way it is toggled. */
+function revealButton(section: HTMLElement) {
+  return section.querySelector<HTMLButtonElement>("button.api-key-reveal");
 }
 
 describe("settings form", () => {
@@ -123,6 +131,11 @@ describe("api key control", () => {
     expect([...document.querySelectorAll("input")].map((input) => input.value)).not.toContain(LEAKED_KEY);
     expect(apiKeyInput(section).value).toBe(KEY_SENTINEL);
     expect(apiKeyInput(settingsSection(t("translation"))).value).toBe("");
+    expect(revealButton(section)).toBeNull();
+    expect(revealButton(settingsSection(t("translation")))).toBeNull();
+
+    typeInto(apiKeyInput(section), "fresh-key");
+    expect(revealButton(settingsSection(t("meetingNotesProvider")))).toBeTruthy();
   });
 
   it("emits set while typing and keep once an unconfigured input is emptied", () => {
@@ -174,23 +187,47 @@ describe("api key control", () => {
     expect(onChange).toHaveBeenLastCalledWith({ action: "set", value: "fresh-key" });
   });
 
-  it("toggles between password and text without revealing a stored key", () => {
+  it("offers no eye while there is nothing but dots to reveal", () => {
     const view = render(<ApiKeyField configured={true} secret={{ action: "keep" }} t={t} onChange={vi.fn()} />);
+    expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).value).toBe(KEY_SENTINEL);
+    expect(screen.queryByRole("button", { name: t("apiKeyShow") })).toBeNull();
+
+    view.rerender(<ApiKeyField configured={true} secret={{ action: "clear" }} t={t} onChange={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: t("apiKeyShow") })).toBeNull();
+
+    view.rerender(<ApiKeyField configured={false} secret={{ action: "keep" }} t={t} onChange={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: t("apiKeyShow") })).toBeNull();
+  });
+
+  it("toggles the typed value between password and text", () => {
+    render(<ApiKeyField configured={false} secret={{ action: "set", value: "typed-key" }} t={t} onChange={vi.fn()} />);
     expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).type).toBe("password");
 
     fireEvent.click(screen.getByRole("button", { name: t("apiKeyShow") }));
     const revealed = screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement;
     expect(revealed.type).toBe("text");
-    expect(revealed.value).toBe(KEY_SENTINEL);
+    expect(revealed.value).toBe("typed-key");
 
-    view.rerender(<ApiKeyField configured={true} secret={{ action: "set", value: "typed-key" }} t={t} onChange={vi.fn()} />);
-    expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).value).toBe("typed-key");
     fireEvent.click(screen.getByRole("button", { name: t("apiKeyHide") }));
     expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).type).toBe("password");
   });
 
+  it("forgets the reveal when the typed value goes away", () => {
+    const view = render(<ApiKeyField configured={true} secret={{ action: "set", value: "typed-key" }} t={t} onChange={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: t("apiKeyShow") }));
+    expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).type).toBe("text");
+
+    view.rerender(<ApiKeyField configured={true} secret={{ action: "clear" }} t={t} onChange={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: t("apiKeyHide") })).toBeNull();
+    expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).type).toBe("password");
+
+    view.rerender(<ApiKeyField configured={true} secret={{ action: "set", value: "another-key" }} t={t} onChange={vi.fn()} />);
+    expect(screen.getByRole("button", { name: t("apiKeyShow") })).toBeTruthy();
+    expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).type).toBe("password");
+  });
+
   it("disables the input and the reveal button together", () => {
-    render(<ApiKeyField configured={true} disabled={true} secret={{ action: "keep" }} t={t} onChange={vi.fn()} />);
+    render(<ApiKeyField configured={true} disabled={true} secret={{ action: "set", value: "typed-key" }} t={t} onChange={vi.fn()} />);
 
     expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: t("apiKeyShow") }) as HTMLButtonElement).disabled).toBe(true);
@@ -203,11 +240,12 @@ describe("provider connection test", () => {
     await renderApp(t);
     openTab(t, "settings");
     const section = settingsSection(t("meetingNotesProvider"));
-    expect(within(section).getByText(t("providerUnverified"))).toBeTruthy();
+    expect(testPill(section).textContent).toContain(t("providerTestConnection"));
+    expect(testPill(section).disabled).toBe(false);
 
     typeInto(within(section).getByLabelText(t("meetingNotesModel")), "gpt-5-mini");
     typeInto(apiKeyInput(section), "notes-secret");
-    fireEvent.click(testButton(section));
+    fireEvent.click(testPill(section));
 
     await waitFor(() => expect(callsOf("test_provider_settings")).toHaveLength(1));
     const request = testedPayload();
@@ -216,10 +254,12 @@ describe("provider connection test", () => {
     expect(request.secrets.meetingNotesApiKey).toEqual({ action: "set", value: "notes-secret" });
     expect(JSON.stringify(request.settings)).not.toContain("verified");
     expect(JSON.stringify(request.settings)).not.toContain("apiKeyConfigured");
-    await screen.findByText(t("providerTestPassed"));
+    await waitFor(() => expect(testPill(settingsSection(t("meetingNotesProvider"))).textContent).toContain(t("providerVerified")));
+    expect(testPill(settingsSection(t("meetingNotesProvider"))).disabled).toBe(true);
+    expect(within(settingsSection(t("meetingNotesProvider"))).queryByRole("alert")).toBeNull();
     expect(within(settingsSection(t("meetingNotesProvider"))).getByText(t("apiKeyStored"))).toBeTruthy();
     expect(apiKeyInput(settingsSection(t("meetingNotesProvider"))).value).toBe(KEY_SENTINEL);
-    expect(within(settingsSection(t("translation"))).getByText(t("providerUnverified"))).toBeTruthy();
+    expect(testPill(settingsSection(t("translation"))).textContent).toContain(t("providerTestConnection"));
 
     fireEvent.click(screen.getByRole("button", { name: t("saved") }));
     await waitFor(() => expect(callsOf("save_settings")).toHaveLength(1));
@@ -232,39 +272,45 @@ describe("provider connection test", () => {
     openTab(t, "settings");
     scriptFailure("test_provider_settings", errorPayload({ code: "PROVIDER_UNAUTHORIZED", messageKey: "meetingNotesErrorProviderUnauthorized", retryable: false }));
 
-    fireEvent.click(testButton(settingsSection(t("translation"))));
+    fireEvent.click(testPill(settingsSection(t("translation"))));
 
     await screen.findByText(t("meetingNotesErrorProviderUnauthorized"));
     const section = settingsSection(t("translation"));
     expect(within(section).getByRole("alert").textContent).toBe(t("meetingNotesErrorProviderUnauthorized"));
-    expect(within(section).queryByText(t("providerVerified"))).toBeNull();
+    expect(testPill(section).textContent).toContain(t("providerTestFailedRetry"));
+    expect(testPill(section).title).toBe(t("meetingNotesErrorProviderUnauthorized"));
+    expect(testPill(section).disabled).toBe(false);
     expect((within(section).getByLabelText(t("translationModel")) as HTMLInputElement).value).toBe("Hy-MT2-1.8B");
     expect(callsOf("save_settings")).toHaveLength(0);
+
+    fireEvent.click(testPill(section));
+    await waitFor(() => expect(callsOf("test_provider_settings")).toHaveLength(2));
   });
 
   it("drops the verified badge as soon as the endpoint is edited", async () => {
     scriptAppDefaults({ settings: appSettings((next) => { next.translation.verified = true; }) });
     await renderApp(t);
     openTab(t, "settings");
-    expect(within(settingsSection(t("translation"))).getByText(t("providerVerified"))).toBeTruthy();
+    expect(testPill(settingsSection(t("translation"))).textContent).toContain(t("providerVerified"));
 
     typeInto(within(settingsSection(t("translation"))).getByLabelText(t("translationEndpoint")), "https://translate.example.com/v1");
 
-    expect(within(settingsSection(t("translation"))).getByText(t("providerUnverified"))).toBeTruthy();
-    expect(within(settingsSection(t("meetingNotesProvider"))).getByText(t("providerUnverified"))).toBeTruthy();
+    expect(testPill(settingsSection(t("translation"))).textContent).toContain(t("providerTestConnection"));
+    expect(testPill(settingsSection(t("translation"))).disabled).toBe(false);
+    expect(testPill(settingsSection(t("meetingNotesProvider"))).textContent).toContain(t("providerTestConnection"));
   });
 
   it("runs one request per click and locks the other buttons while it is in flight", async () => {
     scriptAppDefaults();
     await renderApp(t);
     openTab(t, "settings");
-    const button = testButton(settingsSection(t("translation")));
+    fireEvent.click(testPill(settingsSection(t("translation"))));
+    fireEvent.click(testPill(settingsSection(t("translation"))));
 
-    fireEvent.click(button);
-    fireEvent.click(button);
-
-    expect(button.disabled).toBe(true);
-    expect(testButton(settingsSection(t("meetingNotesProvider"))).disabled).toBe(true);
+    expect(testPill(settingsSection(t("translation"))).textContent).toContain(t("providerTesting"));
+    expect(testPill(settingsSection(t("translation"))).disabled).toBe(true);
+    expect(testPill(settingsSection(t("meetingNotesProvider"))).disabled).toBe(true);
+    expect(fetchButton(settingsSection(t("translation"))).disabled).toBe(true);
     expect((screen.getByRole("button", { name: t("saveSettings") }) as HTMLButtonElement).disabled).toBe(true);
     await waitFor(() => expect(callsOf("test_provider_settings")).toHaveLength(1));
   });
@@ -274,11 +320,11 @@ describe("provider connection test", () => {
     await renderApp(t);
     openTab(t, "settings");
 
-    expect(testButton(settingsSection(t("translation"))).disabled).toBe(true);
-    expect(testButton(settingsSection(t("meetingNotesProvider"))).disabled).toBe(false);
+    expect(testPill(settingsSection(t("translation"))).disabled).toBe(true);
+    expect(testPill(settingsSection(t("meetingNotesProvider"))).disabled).toBe(false);
 
     typeInto(apiKeyInput(settingsSection(t("translation"))), "");
-    expect(testButton(settingsSection(t("translation"))).disabled).toBe(false);
+    expect(testPill(settingsSection(t("translation"))).disabled).toBe(false);
   });
 });
 
@@ -388,7 +434,7 @@ describe("model discovery", () => {
     expect(fetchButton(settingsSection(t("translation"))).disabled).toBe(true);
     expect(fetchButton(settingsSection(t("meetingNotesProvider"))).disabled).toBe(false);
 
-    fireEvent.click(testButton(settingsSection(t("meetingNotesProvider"))));
+    fireEvent.click(testPill(settingsSection(t("meetingNotesProvider"))));
 
     expect(fetchButton(settingsSection(t("meetingNotesProvider"))).disabled).toBe(true);
     expect(callsOf("list_provider_models")).toHaveLength(0);

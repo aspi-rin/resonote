@@ -39,7 +39,6 @@ export type ProviderTestState = "failed" | "testing" | "unverified" | "verified"
 export interface ProviderTestProps {
   confirmed: AppSettings;
   errors: Record<ProviderKind, string | null>;
-  passed: ProviderKind | null;
   running: ProviderKind | null;
   test: (provider: ProviderKind) => void;
 }
@@ -272,16 +271,21 @@ export function apiKeySecretFromInput(value: string, configured: boolean): Secre
   return { action: "set", value: typed };
 }
 
+/** The eye only appears while a new value is being typed: the sentinel, an empty
+ *  field and a pending clear have nothing to reveal, so a toggle there would
+ *  swap one row of dots for another. */
 export function ApiKeyField({ configured, disabled = false, onChange, secret, t }: { configured: boolean; disabled?: boolean; onChange: (secret: SecretUpdate) => void; secret: SecretUpdate; t: Translate }) {
   const [revealed, setRevealed] = useState(false);
+  const typing = secret.action === "set";
   const sentinel = secret.action === "keep" && configured;
-  const value = secret.action === "set" ? secret.value : sentinel ? KEY_SENTINEL : "";
+  const value = typing ? secret.value : sentinel ? KEY_SENTINEL : "";
   const chip = secret.action === "clear" ? "apiKeyWillClear" : configured ? "apiKeyStored" : "apiKeyNotStored";
+  useEffect(() => { if (!typing) setRevealed(false); }, [typing]);
   return <div class="field field-wide api-key-field">
     <span>{t("apiKey")}</span>
-    <div class="api-key-row">
-      <input autocomplete="off" disabled={disabled} placeholder={t("apiKeyPlaceholder")} spellcheck={false} type={revealed ? "text" : "password"} value={value} onFocus={(event) => { if (sentinel) event.currentTarget.select(); }} onInput={(event) => onChange(apiKeySecretFromInput(event.currentTarget.value, configured))} />
-      <button aria-label={revealed ? t("apiKeyHide") : t("apiKeyShow")} class="api-key-reveal" disabled={disabled} type="button" onClick={() => setRevealed(!revealed)}><Icon name={revealed ? "eyeOff" : "eye"} /></button>
+    <div class={`api-key-row ${typing ? "has-reveal" : ""}`}>
+      <input autocomplete="off" disabled={disabled} placeholder={t("apiKeyPlaceholder")} spellcheck={false} type={typing && revealed ? "text" : "password"} value={value} onFocus={(event) => { if (sentinel) event.currentTarget.select(); }} onInput={(event) => onChange(apiKeySecretFromInput(event.currentTarget.value, configured))} />
+      {typing && <button aria-label={revealed ? t("apiKeyHide") : t("apiKeyShow")} class="api-key-reveal" disabled={disabled} type="button" onClick={() => setRevealed(!revealed)}><Icon name={revealed ? "eyeOff" : "eye"} /></button>}
     </div>
     <p class={`api-key-note ${chip}`}>{t(chip)}</p>
   </div>;
@@ -338,16 +342,30 @@ export function providerTestState({ dirty, failed, testing, verified }: { dirty:
   return failed ? "failed" : "unverified";
 }
 
-export function ProviderStatusRow({ disabled, error, passed, state, t, test }: { disabled: boolean; error: string | null; passed: boolean; state: ProviderTestState; t: Translate; test: () => void }) {
-  const label = state === "failed" && error ? error : t(state === "testing" ? "providerTesting" : state !== "verified" ? "providerUnverified" : passed ? "providerTestPassed" : "providerVerified");
-  return <div class="provider-status">
-    <button class="icon-button" disabled={disabled || state === "testing"} type="button" onClick={test}>{t("providerTestConnection")}</button>
-    <p class={`provider-status-note ${state}`} role={state === "failed" ? "alert" : undefined}><i />{label}</p>
-  </div>;
+/** The section-header twin of the ASR model pill: it carries the whole state of
+ *  the connection test, so the section body only has to explain a failure. */
+export function ProviderTestButton({ disabled, error, state, t, test }: { disabled: boolean; error: string | null; state: ProviderTestState; t: Translate; test: () => void }) {
+  const verified = state === "verified";
+  const label = t(verified ? "providerVerified" : state === "testing" ? "providerTesting" : state === "failed" ? "providerTestFailedRetry" : "providerTestConnection");
+  return <button aria-live="polite" class={`model-action-button provider-action-button ${state}`} disabled={disabled || verified || state === "testing"} title={state === "failed" && error ? error : label} type="button" onClick={test}>
+    <span class="model-action-content">
+      <span class="model-action-icon" aria-hidden="true">
+        <span class={`model-action-icon-state ${verified ? "" : "active"}`}><Icon name="shield" /></span>
+        <span class={`model-action-icon-state ready ${verified ? "active" : ""}`}><Icon name="check" /></span>
+      </span>
+      <span>{label}</span>
+    </span>
+  </button>;
 }
 
-export function MeetingNotesProviderSection({ blocked, fetch, fetchBlocked, onSecret, secret, settings, status, t, update }: { blocked: boolean; fetch: ProviderFetchProps; fetchBlocked: boolean; onSecret: (secret: SecretUpdate) => void; secret: SecretUpdate; settings: AppSettings; status: ComponentChildren; t: Translate; update: (mutate: (next: AppSettings) => void) => void }) {
-  return <SettingsSection icon="chat" title={t("meetingNotesProvider")}>
+/** Only the details the header pill cannot carry: why the last test failed. */
+export function ProviderErrorNote({ error, state }: { error: string | null; state: ProviderTestState }) {
+  if (state !== "failed" || !error) return null;
+  return <p class="provider-status-note failed" role="alert"><i />{error}</p>;
+}
+
+export function MeetingNotesProviderSection({ action, blocked, fetch, fetchBlocked, onSecret, secret, settings, status, t, update }: { action: ComponentChildren; blocked: boolean; fetch: ProviderFetchProps; fetchBlocked: boolean; onSecret: (secret: SecretUpdate) => void; secret: SecretUpdate; settings: AppSettings; status: ComponentChildren; t: Translate; update: (mutate: (next: AppSettings) => void) => void }) {
+  return <SettingsSection action={action} icon="chat" title={t("meetingNotesProvider")}>
     <p class="section-note">{t("meetingNotesProviderHint")}</p>
     <div class="form-grid">
       <ProviderEndpointFields endpoint={settings.meetingNotes.endpoint} endpointLabel={t("meetingNotesEndpoint")} t={t} onEndpoint={(value) => update((next) => { next.meetingNotes.endpoint = value; })} onSelect={(preset) => update((next) => { next.meetingNotes.endpoint = preset.endpoint; next.meetingNotes.model = preset.defaultModel; })} />

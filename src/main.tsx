@@ -27,7 +27,8 @@ import {
   EndpointWarning,
   ProviderEndpointFields,
   ProviderModelField,
-  ProviderStatusRow,
+  ProviderErrorNote,
+  ProviderTestButton,
   analysisStatusFromEvent,
   analysisStatusFromView,
   describeError,
@@ -136,7 +137,6 @@ export function App() {
   const [confirmed, setConfirmed] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [testErrors, setTestErrors] = useState<Record<ProviderKind, string | null>>(NO_TEST_ERRORS);
   const [testing, setTesting] = useState<ProviderKind | null>(null);
-  const [tested, setTested] = useState<ProviderKind | null>(null);
   const testInFlight = useRef(false);
   const [fetchedModels, setFetchedModels] = useState<Record<ProviderKind, string[]>>(NO_FETCHED_MODELS);
   const [fetchErrors, setFetchErrors] = useState<Record<ProviderKind, string | null>>(NO_TEST_ERRORS);
@@ -466,7 +466,6 @@ export function App() {
       const persisted = await invoke<AppSettings>("test_provider_settings", { request: { provider, ...saveSettingsPayload(settings, secrets) } });
       applyPersisted(persisted);
       setSecrets(KEEP_SECRETS);
-      setTested(provider);
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1800);
     } catch (reason) {
@@ -710,7 +709,7 @@ export function App() {
 
           {tab === "record" && <RecordView t={t} settings={settings} recording={recording} transcription={transcription} model={model} liveSegments={liveTranscript.segments} liveTranslations={liveTranscript.translations} busy={busy} isActive={isActive} changeLanguages={changeRecordingLanguages} changeSource={changeAudioSource} start={startRecording} stop={stopRecording} />}
           {tab === "history" && <HistoryView t={t} locale={locale} history={history} analyses={analyses} analysisBusy={analysisBusy} analysisErrors={analysisErrors} analysisStatuses={analysisStatuses} expanded={expanded} globalContext={globalContext.content} settings={settings} cancel={(sessionId) => controlRun(sessionId, "cancel_session_analysis")} generate={generateAnalysis} openSettings={() => setTab("settings")} retry={(sessionId) => controlRun(sessionId, "retry_session_analysis")} saveContext={(sessionId, content) => void saveMeetingContext(sessionId, content)} toggle={toggleSession} refresh={() => void refreshHistory()} open={(sessionId) => void invoke("open_recording_directory", { sessionId }).catch((reason) => setError(String(reason)))} remove={(sessionId) => void deleteRecording(sessionId)} />}
-          {tab === "settings" && <SettingsView t={t} settings={settings} models={models} busy={busy || isActive} modelTransitioning={modelTransitioning} saved={saved} update={update} save={() => void saveSettings()} model={model} selectModel={(modelId) => void selectModel(modelId)} installModel={installModel} cancelModel={() => void cancelModel()} chooseOutputDirectory={() => void chooseOutputDirectory()} globalContext={globalDraft} globalNotice={globalNotice} globalRevision={globalContext.revision} saveGlobalContext={() => void saveGlobalContext()} secrets={secrets} providerFetch={{ errors: fetchErrors, fetch: (provider) => void fetchProviderModels(provider), models: fetchedModels, running: fetchingModels }} providerTest={{ confirmed, errors: testErrors, passed: tested, running: testing, test: (provider) => void testProvider(provider) }} updateGlobalContext={setGlobalDraft} updateSecret={(name, secret) => setSecrets((current) => ({ ...current, [name]: secret }))} />}
+          {tab === "settings" && <SettingsView t={t} settings={settings} models={models} busy={busy || isActive} modelTransitioning={modelTransitioning} saved={saved} update={update} save={() => void saveSettings()} model={model} selectModel={(modelId) => void selectModel(modelId)} installModel={installModel} cancelModel={() => void cancelModel()} chooseOutputDirectory={() => void chooseOutputDirectory()} globalContext={globalDraft} globalNotice={globalNotice} globalRevision={globalContext.revision} saveGlobalContext={() => void saveGlobalContext()} secrets={secrets} providerFetch={{ errors: fetchErrors, fetch: (provider) => void fetchProviderModels(provider), models: fetchedModels, running: fetchingModels }} providerTest={{ confirmed, errors: testErrors, running: testing, test: (provider) => void testProvider(provider) }} updateGlobalContext={setGlobalDraft} updateSecret={(name, secret) => setSecrets((current) => ({ ...current, [name]: secret }))} />}
         </div>
       </main>
     </div>
@@ -856,14 +855,9 @@ export function SettingsView({ t, settings, models, busy, modelTransitioning, sa
   const translationBlocked = secretBlocksSave(settings.translation.endpoint, settings.translation.apiKeyConfigured, secrets.translationApiKey);
   const meetingNotesBlocked = secretBlocksSave(settings.meetingNotes.endpoint, settings.meetingNotes.apiKeyConfigured, secrets.meetingNotesApiKey);
   const fetchBlocked = (blocked: boolean) => busy || blocked || providerTest.running !== null;
-  const providerStatus = (provider: ProviderKind, blocked: boolean, secret: SecretUpdate) => <ProviderStatusRow
-    disabled={busy || blocked || providerTest.running !== null}
-    error={providerTest.errors[provider]}
-    passed={saved && providerTest.passed === provider}
-    state={providerTestState({ dirty: providerDirty(settings, providerTest.confirmed, provider, secret), failed: providerTest.errors[provider] !== null, testing: providerTest.running === provider, verified: settings[provider].verified })}
-    t={t}
-    test={() => providerTest.test(provider)}
-  />;
+  const providerState = (provider: ProviderKind, secret: SecretUpdate) => providerTestState({ dirty: providerDirty(settings, providerTest.confirmed, provider, secret), failed: providerTest.errors[provider] !== null, testing: providerTest.running === provider, verified: settings[provider].verified });
+  const providerAction = (provider: ProviderKind, blocked: boolean, secret: SecretUpdate) => <ProviderTestButton disabled={busy || blocked || providerTest.running !== null} error={providerTest.errors[provider]} state={providerState(provider, secret)} t={t} test={() => providerTest.test(provider)} />;
+  const providerStatus = (provider: ProviderKind, secret: SecretUpdate) => <ProviderErrorNote error={providerTest.errors[provider]} state={providerState(provider, secret)} />;
   return <div class="settings-stack">
     <SettingsSection icon="mic" title={t("audio")}>
       <div class="form-grid"><RangeField label={t("microphoneGain")} value={settings.audio.microphoneGain} min={0} max={4} step={0.1} suffix="×" onChange={(value) => update((next) => { next.audio.microphoneGain = value; })} /><RangeField label={t("systemGain")} value={settings.audio.systemGain} min={0} max={4} step={0.1} suffix="×" onChange={(value) => update((next) => { next.audio.systemGain = value; })} />
@@ -883,9 +877,9 @@ export function SettingsView({ t, settings, models, busy, modelTransitioning, sa
       </div>
     </SettingsSection>
 
-    <SettingsSection icon="text" title={t("translation")}><Toggle label={t("enableTranslation")} checked={settings.translation.enabled} onChange={(checked) => update((next) => { next.translation.enabled = checked; })} /><div class="form-grid"><SelectField disabled={!settings.translation.enabled} label={t("translationLanguage")} value={settings.translation.targetLanguage} onChange={(value) => update((next) => { next.translation.targetLanguage = value; })} options={[{ value: "Chinese", label: t("chinese") }, { value: "English", label: t("english") }, { value: "Japanese", label: t("japanese") }, { value: "Korean", label: t("korean") }]} /><ProviderEndpointFields disabled={!settings.translation.enabled} endpoint={settings.translation.endpoint} endpointLabel={t("translationEndpoint")} t={t} onEndpoint={(value) => update((next) => { next.translation.endpoint = value; })} onSelect={(preset) => update((next) => { next.translation.endpoint = preset.endpoint; next.translation.model = preset.defaultModel; })} /><ProviderModelField disabled={!settings.translation.enabled} endpoint={settings.translation.endpoint} fetch={providerFetch} fetchBlocked={fetchBlocked(translationBlocked)} label={t("translationModel")} provider="translation" t={t} value={settings.translation.model} onChange={(value) => update((next) => { next.translation.model = value; })} /><ApiKeyField configured={settings.translation.apiKeyConfigured} secret={secrets.translationApiKey} t={t} onChange={(secret) => updateSecret("translationApiKey", secret)} /></div><EndpointWarning blocked={translationBlocked} endpoint={settings.translation.endpoint} t={t} />{providerStatus("translation", translationBlocked, secrets.translationApiKey)}</SettingsSection>
+    <SettingsSection action={providerAction("translation", translationBlocked, secrets.translationApiKey)} icon="text" title={t("translation")}><Toggle label={t("enableTranslation")} checked={settings.translation.enabled} onChange={(checked) => update((next) => { next.translation.enabled = checked; })} /><div class="form-grid"><SelectField disabled={!settings.translation.enabled} label={t("translationLanguage")} value={settings.translation.targetLanguage} onChange={(value) => update((next) => { next.translation.targetLanguage = value; })} options={[{ value: "Chinese", label: t("chinese") }, { value: "English", label: t("english") }, { value: "Japanese", label: t("japanese") }, { value: "Korean", label: t("korean") }]} /><ProviderEndpointFields disabled={!settings.translation.enabled} endpoint={settings.translation.endpoint} endpointLabel={t("translationEndpoint")} t={t} onEndpoint={(value) => update((next) => { next.translation.endpoint = value; })} onSelect={(preset) => update((next) => { next.translation.endpoint = preset.endpoint; next.translation.model = preset.defaultModel; })} /><ProviderModelField disabled={!settings.translation.enabled} endpoint={settings.translation.endpoint} fetch={providerFetch} fetchBlocked={fetchBlocked(translationBlocked)} label={t("translationModel")} provider="translation" t={t} value={settings.translation.model} onChange={(value) => update((next) => { next.translation.model = value; })} /><ApiKeyField configured={settings.translation.apiKeyConfigured} secret={secrets.translationApiKey} t={t} onChange={(secret) => updateSecret("translationApiKey", secret)} /></div><EndpointWarning blocked={translationBlocked} endpoint={settings.translation.endpoint} t={t} />{providerStatus("translation", secrets.translationApiKey)}</SettingsSection>
 
-    <MeetingNotesProviderSection blocked={meetingNotesBlocked} fetch={providerFetch} fetchBlocked={fetchBlocked(meetingNotesBlocked)} secret={secrets.meetingNotesApiKey} settings={settings} status={providerStatus("meetingNotes", meetingNotesBlocked, secrets.meetingNotesApiKey)} t={t} update={update} onSecret={(secret) => updateSecret("meetingNotesApiKey", secret)} />
+    <MeetingNotesProviderSection action={providerAction("meetingNotes", meetingNotesBlocked, secrets.meetingNotesApiKey)} blocked={meetingNotesBlocked} fetch={providerFetch} fetchBlocked={fetchBlocked(meetingNotesBlocked)} secret={secrets.meetingNotesApiKey} settings={settings} status={providerStatus("meetingNotes", secrets.meetingNotesApiKey)} t={t} update={update} onSecret={(secret) => updateSecret("meetingNotesApiKey", secret)} />
 
     <GlobalContextSection busy={busy} content={globalContext} notice={globalNotice} revision={globalRevision} save={saveGlobalContext} t={t} onChange={updateGlobalContext} />
 
