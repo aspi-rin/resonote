@@ -70,6 +70,6 @@ For architecture details, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). For 
 
 - **Local by Default**: Recording, ASR, and every audio file stay on the machine. Both configurable endpoints default to loopback.
 - **What Leaves the Machine**: Translation sends one transcript sentence per request. Meeting notes send the transcript text plus your global and meeting context. Nothing else is transmitted — audio is never uploaded, and both features are used only against the endpoints you configure in Settings.
-- **API Keys**: Each endpoint takes an optional API key, stored locally in `settings.json` and bound to the endpoint it was saved for. Keys are never returned to the UI, written into recording folders, or logged.
+- **API Keys**: Each endpoint takes an optional API key, stored locally in `settings.json` and bound to the endpoint it was saved for. The Settings form shows the key for its own endpoint so you can check or reveal it; keys are never written into recording folders or logged.
 - **Safe Downloads**: Models are checked against SHA-256 hashes and securely extracted.
 - **Sandboxed WebView**: Uses minimal Tauri capabilities to restrict unauthorized file system or network access.

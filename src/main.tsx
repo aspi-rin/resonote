@@ -23,14 +23,15 @@ import {
   MeetingNotesChips,
   MeetingNotesDetail,
   MeetingNotesProviderSection,
-  ApiKeyField,
   EndpointWarning,
   ProviderEndpointFields,
+  ProviderKeyField,
   ProviderModelField,
   ProviderErrorNote,
   ProviderTestButton,
   analysisStatusFromEvent,
   analysisStatusFromView,
+  apiKeySecret,
   describeError,
   isNewerAnalysisStatus,
   parseMeetingNotesError,
@@ -39,6 +40,7 @@ import {
   secretBlocksSave,
   type AnalysisStatus,
   type ProviderFetchProps,
+  type ProviderKeyProps,
   type ProviderTestProps,
 } from "./meeting_notes_ui";
 import {
@@ -93,6 +95,14 @@ const FALLBACK_MODEL_CATALOG: ModelCatalogEntry[] = [
 const KEEP_SECRETS: SettingsSecretUpdates = { meetingNotesApiKey: { action: "keep" }, translationApiKey: { action: "keep" } };
 const NO_TEST_ERRORS: Record<ProviderKind, string | null> = { meetingNotes: null, translation: null };
 const NO_FETCHED_MODELS: Record<ProviderKind, string[]> = { meetingNotes: [], translation: [] };
+/** No draft means the field still shows the key the backend last returned. */
+const NO_KEY_DRAFTS: Record<ProviderKind, string | null> = { meetingNotes: null, translation: null };
+/** How long the form stays quiet before an edit is written to disk. */
+export const AUTOSAVE_DELAY_MS = 800;
+
+function secretUpdates(secrets: Record<ProviderKind, SecretUpdate>): SettingsSecretUpdates {
+  return { meetingNotesApiKey: secrets.meetingNotes, translationApiKey: secrets.translation };
+}
 
 function saveSettingsPayload(settings: AppSettings, secrets: SettingsSecretUpdates = KEEP_SECRETS) {
   const payload: AppSettingsWithoutSecrets = {
@@ -133,7 +143,10 @@ export function App() {
   const [modelTransitioning, setModelTransitioning] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [secrets, setSecrets] = useState<SettingsSecretUpdates>(KEEP_SECRETS);
+  const [keyDrafts, setKeyDrafts] = useState<Record<ProviderKind, string | null>>(NO_KEY_DRAFTS);
+  const [keyFocused, setKeyFocused] = useState(false);
+  const autosaveTimer = useRef<number | null>(null);
+  const rejectedSave = useRef<string | null>(null);
   const [confirmed, setConfirmed] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [testErrors, setTestErrors] = useState<Record<ProviderKind, string | null>>(NO_TEST_ERRORS);
   const [testing, setTesting] = useState<ProviderKind | null>(null);
@@ -155,6 +168,40 @@ export function App() {
   const expandedRef = useRef<string | null>(null);
   const t = useMemo(() => translator(settings.desktop.language), [settings.desktop.language]);
   const locale = resolveLanguage(settings.desktop.language);
+
+  // One derivation feeds the key field, the save payload and every guard: the
+  // field value is the in-progress edit when there is one, and the update sent
+  // to the backend is its difference against the last confirmed key.
+  const apiKeys: Record<ProviderKind, string> = {
+    meetingNotes: keyDrafts.meetingNotes ?? settings.meetingNotes.apiKey,
+    translation: keyDrafts.translation ?? settings.translation.apiKey,
+  };
+  const secrets: Record<ProviderKind, SecretUpdate> = {
+    meetingNotes: apiKeySecret(apiKeys.meetingNotes, settings.meetingNotes.endpoint, confirmed.meetingNotes),
+    translation: apiKeySecret(apiKeys.translation, settings.translation.endpoint, confirmed.translation),
+  };
+  const blocked: Record<ProviderKind, boolean> = {
+    meetingNotes: secretBlocksSave(settings.meetingNotes.endpoint, apiKeys.meetingNotes),
+    translation: secretBlocksSave(settings.translation.endpoint, apiKeys.translation),
+  };
+  const pendingSave = saveSettingsPayload(settings, secretUpdates(secrets));
+  const pendingSignature = JSON.stringify(pendingSave);
+  // A rejected payload is never retried on its own: only a further edit, which
+  // changes the signature, may reach the backend again.
+  const autosaveReady = isTauri
+    && pendingSignature !== JSON.stringify(saveSettingsPayload(confirmed))
+    && rejectedSave.current !== pendingSignature
+    && !blocked.meetingNotes
+    && !blocked.translation
+    && !busy
+    && testing === null
+    && fetchingModels === null;
+
+  const cancelAutosave = () => {
+    if (autosaveTimer.current === null) return;
+    window.clearTimeout(autosaveTimer.current);
+    autosaveTimer.current = null;
+  };
 
   const refreshHistory = async () => {
     if (!isTauri) return;
@@ -288,6 +335,7 @@ export function App() {
   /** Backend answers are the only source of the confirmed provider state the
    *  connection status compares the form against. */
   const applyPersisted = (persisted: AppSettings) => {
+    rejectedSave.current = null;
     setSettings(persisted);
     setConfirmed(persisted);
   };
@@ -431,6 +479,22 @@ export function App() {
     root.lang = locale;
   }, [settings.desktop.theme, locale]);
 
+  // Autosave: there is no save button, so every edit reaches disk once the form
+  // has been quiet for a moment. A focused key field, a blocked provider and an
+  // in-flight request all hold the timer back rather than cancel the edit.
+  useEffect(() => {
+    if (!autosaveReady || keyFocused) return;
+    const timer = window.setTimeout(() => {
+      autosaveTimer.current = null;
+      void saveSettings();
+    }, AUTOSAVE_DELAY_MS);
+    autosaveTimer.current = timer;
+    return () => {
+      window.clearTimeout(timer);
+      if (autosaveTimer.current === timer) autosaveTimer.current = null;
+    };
+  }, [autosaveReady, keyFocused, pendingSignature]);
+
   const update = (mutate: (next: AppSettings) => void) => {
     setSaved(false);
     setSettings((current) => {
@@ -440,32 +504,49 @@ export function App() {
     });
   };
 
+  const updateApiKey = (provider: ProviderKind, value: string) => {
+    setSaved(false);
+    setKeyDrafts((current) => ({ ...current, [provider]: value }));
+  };
+
   const saveSettings = async () => {
+    cancelAutosave();
+    const attempted = pendingSignature;
     setBusy(true);
     setError(null);
     try {
-      const persisted = isTauri ? await invoke<AppSettings>("save_settings", saveSettingsPayload(settings, secrets)) : settings;
+      const persisted = isTauri ? await invoke<AppSettings>("save_settings", pendingSave) : settings;
       applyPersisted(persisted);
-      setSecrets(KEEP_SECRETS);
+      setKeyDrafts(NO_KEY_DRAFTS);
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1800);
     } catch (reason) {
+      rejectedSave.current = attempted;
       setError(String(reason));
     } finally {
       setBusy(false);
     }
   };
 
+  // The blur of the key field is the moment its edit is finished, so it saves
+  // now instead of waiting out another debounce.
+  const focusApiKey = (focused: boolean) => {
+    setKeyFocused(focused);
+    if (focused) cancelAutosave();
+    else if (autosaveReady) void saveSettings();
+  };
+
   const testProvider = async (provider: ProviderKind) => {
     if (testInFlight.current || !isTauri) return;
+    cancelAutosave();
     testInFlight.current = true;
     setTesting(provider);
     setError(null);
     setTestErrors((current) => ({ ...current, [provider]: null }));
     try {
-      const persisted = await invoke<AppSettings>("test_provider_settings", { request: { provider, ...saveSettingsPayload(settings, secrets) } });
+      const persisted = await invoke<AppSettings>("test_provider_settings", { request: { provider, ...pendingSave } });
       applyPersisted(persisted);
-      setSecrets(KEEP_SECRETS);
+      setKeyDrafts(NO_KEY_DRAFTS);
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1800);
     } catch (reason) {
@@ -484,7 +565,7 @@ export function App() {
     setFetchingModels(provider);
     setFetchErrors((current) => ({ ...current, [provider]: null }));
     try {
-      const models = await invoke<string[]>("list_provider_models", { request: { provider, ...saveSettingsPayload(settings, secrets) } });
+      const models = await invoke<string[]>("list_provider_models", { request: { provider, ...pendingSave } });
       setFetchedModels((current) => ({ ...current, [provider]: models }));
     } catch (reason) {
       setFetchErrors((current) => ({ ...current, [provider]: describeError(t, reason) }));
@@ -709,7 +790,7 @@ export function App() {
 
           {tab === "record" && <RecordView t={t} settings={settings} recording={recording} transcription={transcription} model={model} liveSegments={liveTranscript.segments} liveTranslations={liveTranscript.translations} busy={busy} isActive={isActive} changeLanguages={changeRecordingLanguages} changeSource={changeAudioSource} start={startRecording} stop={stopRecording} />}
           {tab === "history" && <HistoryView t={t} locale={locale} history={history} analyses={analyses} analysisBusy={analysisBusy} analysisErrors={analysisErrors} analysisStatuses={analysisStatuses} expanded={expanded} globalContext={globalContext.content} settings={settings} cancel={(sessionId) => controlRun(sessionId, "cancel_session_analysis")} generate={generateAnalysis} openSettings={() => setTab("settings")} retry={(sessionId) => controlRun(sessionId, "retry_session_analysis")} saveContext={(sessionId, content) => void saveMeetingContext(sessionId, content)} toggle={toggleSession} refresh={() => void refreshHistory()} open={(sessionId) => void invoke("open_recording_directory", { sessionId }).catch((reason) => setError(String(reason)))} remove={(sessionId) => void deleteRecording(sessionId)} />}
-          {tab === "settings" && <SettingsView t={t} settings={settings} models={models} busy={busy || isActive} modelTransitioning={modelTransitioning} saved={saved} update={update} save={() => void saveSettings()} model={model} selectModel={(modelId) => void selectModel(modelId)} installModel={installModel} cancelModel={() => void cancelModel()} chooseOutputDirectory={() => void chooseOutputDirectory()} globalContext={globalDraft} globalNotice={globalNotice} globalRevision={globalContext.revision} saveGlobalContext={() => void saveGlobalContext()} secrets={secrets} providerFetch={{ errors: fetchErrors, fetch: (provider) => void fetchProviderModels(provider), models: fetchedModels, running: fetchingModels }} providerTest={{ confirmed, errors: testErrors, running: testing, test: (provider) => void testProvider(provider) }} updateGlobalContext={setGlobalDraft} updateSecret={(name, secret) => setSecrets((current) => ({ ...current, [name]: secret }))} />}
+          {tab === "settings" && <SettingsView t={t} settings={settings} models={models} busy={busy || isActive} modelTransitioning={modelTransitioning} saved={saved} update={update} model={model} selectModel={(modelId) => void selectModel(modelId)} installModel={installModel} cancelModel={() => void cancelModel()} chooseOutputDirectory={() => void chooseOutputDirectory()} globalContext={globalDraft} globalNotice={globalNotice} globalRevision={globalContext.revision} saveGlobalContext={() => void saveGlobalContext()} providerFetch={{ errors: fetchErrors, fetch: (provider) => void fetchProviderModels(provider), models: fetchedModels, running: fetchingModels }} providerKeys={{ blocked, focus: focusApiKey, secrets, update: updateApiKey, values: apiKeys }} providerTest={{ confirmed, errors: testErrors, running: testing, test: (provider) => void testProvider(provider) }} updateGlobalContext={setGlobalDraft} />}
         </div>
       </main>
     </div>
@@ -842,22 +923,21 @@ export function HistoryView({ t, locale, history, analyses, analysisBusy, analys
 }) {
   return <div class="view-stack"><div class="view-actions"><p>{history.length} {t("history").toLowerCase()}</p><button class="icon-button" onClick={refresh}><Icon name="refresh" />{t("refresh")}</button></div>
     {history.length === 0 ? <section class="empty-state"><span><Icon name="history" /></span><h2>{t("noHistory")}</h2><p>{t("noHistoryHint")}</p></section> : <div class="history-list">{history.map((entry) => { const isOpen = expanded === entry.sessionId; return <div class="history-item" key={entry.sessionId}>
-      <article class={`history-card ${isOpen ? "expanded" : ""}`} onClick={() => toggle(entry.sessionId)}><div class="history-date"><strong>{new Date(entry.startedAt).toLocaleDateString(locale, { month: "short", day: "numeric" })}</strong><span>{new Date(entry.startedAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" })}</span></div><div class="history-body"><div class="history-title"><strong>{sourceLabel(t, entry.audioSource)}</strong><span>{formatDuration(entry.durationMs)} · {entry.audioFormat.toUpperCase()}</span></div><p class="history-transcript">{entry.transcriptPreview || t("noTranscript")}</p>{entry.translationStatus && <p class="history-translation"><strong>{entry.translationTargetLanguage ? `${t("translateTo")} ${translationLanguageLabel(t, entry.translationTargetLanguage)}` : t("translation")}</strong><span>{entry.translationPreview || (entry.translationStatus === "partial" ? t("translationFailed") : t("translating"))}</span></p>}<div class="history-tags"><span>{t(entry.status === "recording" ? "recording" : entry.status === "interrupted" ? "interrupted" : entry.status === "failed" ? "failed" : "completed")}</span>{entry.transcriptStatus && <span>{t(entry.transcriptStatus === "complete" ? "transcriptComplete" : entry.transcriptStatus === "partial" ? "transcriptPartial" : "transcriptPending")}</span>}{entry.translationStatus && <span>{t(entry.translationStatus === "complete" ? "translationComplete" : entry.translationStatus === "partial" ? "translationPartial" : "translationPending")}</span>}<MeetingNotesChips analysis={analyses[entry.sessionId] ?? null} state={analysisStatuses[entry.sessionId]?.state ?? null} t={t} /></div></div><div class="history-actions"><button aria-expanded={isOpen} class="folder-button" title={t("meetingNotes")} onClick={(event) => { event.stopPropagation(); toggle(entry.sessionId); }}><Icon name="text" /></button><button class="folder-button" title={t("openFolder")} onClick={(event) => { event.stopPropagation(); open(entry.sessionId); }}><Icon name="folder" /></button><button class="folder-button delete-button" disabled={entry.status === "recording"} title={t("deleteRecording")} onClick={(event) => { event.stopPropagation(); remove(entry.sessionId); }}><Icon name="trash" /></button></div></article>
+      <article class={`history-card ${isOpen ? "expanded" : ""}`} onClick={() => toggle(entry.sessionId)}><div class="history-date"><strong>{new Date(entry.startedAt).toLocaleDateString(locale, { month: "short", day: "numeric" })}</strong><span>{new Date(entry.startedAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" })}</span></div><div class="history-body"><div class="history-title"><strong>{sourceLabel(t, entry.audioSource)}</strong><span>{formatDuration(entry.durationMs)} · {entry.audioFormat.toUpperCase()}</span></div><p class="history-transcript">{entry.transcriptPreview || t("noTranscript")}</p>{entry.translationStatus && <p class="history-translation"><strong>{entry.translationTargetLanguage ? `${t("translateTo")} ${translationLanguageLabel(t, entry.translationTargetLanguage)}` : t("translation")}</strong><span>{entry.translationPreview || (entry.translationStatus === "partial" ? t("translationFailed") : t("translating"))}</span></p>}<div class="history-tags"><span>{t(entry.status === "recording" ? "recording" : entry.status === "interrupted" ? "interrupted" : entry.status === "failed" ? "failed" : "completed")}</span>{entry.transcriptStatus && <span>{t(entry.transcriptStatus === "complete" ? "transcriptComplete" : entry.transcriptStatus === "partial" ? "transcriptPartial" : "transcriptPending")}</span>}{entry.translationStatus && <span>{t(entry.translationStatus === "complete" ? "translationComplete" : entry.translationStatus === "partial" ? "translationPartial" : "translationPending")}</span>}<MeetingNotesChips analysis={analyses[entry.sessionId] ?? null} state={analysisStatuses[entry.sessionId]?.state ?? null} t={t} /></div></div><div class="history-actions"><button class="folder-button delete-button" disabled={entry.status === "recording"} title={t("deleteRecording")} onClick={(event) => { event.stopPropagation(); remove(entry.sessionId); }}><Icon name="trash" /></button><button class="folder-button" title={t("openFolder")} onClick={(event) => { event.stopPropagation(); open(entry.sessionId); }}><Icon name="folder" /></button><button aria-expanded={isOpen} class="folder-button" title={t("meetingNotes")} onClick={(event) => { event.stopPropagation(); toggle(entry.sessionId); }}><Icon name="text" /></button></div></article>
       {isOpen && <MeetingNotesDetail analysis={analyses[entry.sessionId] ?? null} busy={analysisBusy === entry.sessionId} entry={entry} error={analysisErrors[entry.sessionId] ?? null} globalContext={globalContext} locale={locale} settings={settings} t={t} cancel={() => cancel(entry.sessionId)} generate={(content, options) => generate(entry.sessionId, content, options)} openSettings={openSettings} retry={() => retry(entry.sessionId)} saveContext={(content) => saveContext(entry.sessionId, content)} />}
     </div>; })}</div>}
   </div>;
 }
 
-export function SettingsView({ t, settings, models, busy, modelTransitioning, saved, update, save, model, selectModel, installModel, cancelModel, chooseOutputDirectory, globalContext, globalNotice, globalRevision, saveGlobalContext, providerFetch, providerTest, secrets, updateGlobalContext, updateSecret }: ViewProps & {
-  settings: AppSettings; models: ModelCatalogEntry[]; busy: boolean; modelTransitioning: boolean; saved: boolean; update: (mutate: (next: AppSettings) => void) => void; save: () => void; model: ModelDownloadStatus; selectModel: (modelId: string) => void; installModel: () => void; cancelModel: () => void; chooseOutputDirectory: () => void;
-  globalContext: GlobalContextContent; globalNotice: string | null; globalRevision: number; saveGlobalContext: () => void; providerFetch: ProviderFetchProps; providerTest: ProviderTestProps; secrets: SettingsSecretUpdates; updateGlobalContext: (content: GlobalContextContent) => void; updateSecret: (name: keyof SettingsSecretUpdates, secret: SecretUpdate) => void;
+export function SettingsView({ t, settings, models, busy, modelTransitioning, saved, update, model, selectModel, installModel, cancelModel, chooseOutputDirectory, globalContext, globalNotice, globalRevision, saveGlobalContext, providerFetch, providerKeys, providerTest, updateGlobalContext }: ViewProps & {
+  settings: AppSettings; models: ModelCatalogEntry[]; busy: boolean; modelTransitioning: boolean; saved: boolean; update: (mutate: (next: AppSettings) => void) => void; model: ModelDownloadStatus; selectModel: (modelId: string) => void; installModel: () => void; cancelModel: () => void; chooseOutputDirectory: () => void;
+  globalContext: GlobalContextContent; globalNotice: string | null; globalRevision: number; saveGlobalContext: () => void; providerFetch: ProviderFetchProps; providerKeys: ProviderKeyProps; providerTest: ProviderTestProps; updateGlobalContext: (content: GlobalContextContent) => void;
 }) {
-  const translationBlocked = secretBlocksSave(settings.translation.endpoint, settings.translation.apiKeyConfigured, secrets.translationApiKey);
-  const meetingNotesBlocked = secretBlocksSave(settings.meetingNotes.endpoint, settings.meetingNotes.apiKeyConfigured, secrets.meetingNotesApiKey);
+  const anyBlocked = providerKeys.blocked.meetingNotes || providerKeys.blocked.translation;
   const fetchBlocked = (blocked: boolean) => busy || blocked || providerTest.running !== null;
-  const providerState = (provider: ProviderKind, secret: SecretUpdate) => providerTestState({ dirty: providerDirty(settings, providerTest.confirmed, provider, secret), failed: providerTest.errors[provider] !== null, testing: providerTest.running === provider, verified: settings[provider].verified });
-  const providerAction = (provider: ProviderKind, blocked: boolean, secret: SecretUpdate) => <ProviderTestButton disabled={busy || blocked || providerTest.running !== null} error={providerTest.errors[provider]} state={providerState(provider, secret)} t={t} test={() => providerTest.test(provider)} />;
-  const providerStatus = (provider: ProviderKind, secret: SecretUpdate) => <ProviderErrorNote error={providerTest.errors[provider]} state={providerState(provider, secret)} />;
+  const providerState = (provider: ProviderKind) => providerTestState({ dirty: providerDirty(settings, providerTest.confirmed, provider, providerKeys.secrets[provider]), failed: providerTest.errors[provider] !== null, testing: providerTest.running === provider, verified: settings[provider].verified });
+  const providerAction = (provider: ProviderKind) => <ProviderTestButton disabled={busy || providerKeys.blocked[provider] || providerTest.running !== null} error={providerTest.errors[provider]} state={providerState(provider)} t={t} test={() => providerTest.test(provider)} />;
+  const providerStatus = (provider: ProviderKind) => <ProviderErrorNote error={providerTest.errors[provider]} state={providerState(provider)} />;
   return <div class="settings-stack">
     <SettingsSection icon="mic" title={t("audio")}>
       <div class="form-grid"><RangeField label={t("microphoneGain")} value={settings.audio.microphoneGain} min={0} max={4} step={0.1} suffix="×" onChange={(value) => update((next) => { next.audio.microphoneGain = value; })} /><RangeField label={t("systemGain")} value={settings.audio.systemGain} min={0} max={4} step={0.1} suffix="×" onChange={(value) => update((next) => { next.audio.systemGain = value; })} />
@@ -877,16 +957,16 @@ export function SettingsView({ t, settings, models, busy, modelTransitioning, sa
       </div>
     </SettingsSection>
 
-    <SettingsSection action={providerAction("translation", translationBlocked, secrets.translationApiKey)} icon="text" title={t("translation")}><Toggle label={t("enableTranslation")} checked={settings.translation.enabled} onChange={(checked) => update((next) => { next.translation.enabled = checked; })} /><div class="form-grid"><SelectField disabled={!settings.translation.enabled} label={t("translationLanguage")} value={settings.translation.targetLanguage} onChange={(value) => update((next) => { next.translation.targetLanguage = value; })} options={[{ value: "Chinese", label: t("chinese") }, { value: "English", label: t("english") }, { value: "Japanese", label: t("japanese") }, { value: "Korean", label: t("korean") }]} /><ProviderEndpointFields disabled={!settings.translation.enabled} endpoint={settings.translation.endpoint} endpointLabel={t("translationEndpoint")} t={t} onEndpoint={(value) => update((next) => { next.translation.endpoint = value; })} onSelect={(preset) => update((next) => { next.translation.endpoint = preset.endpoint; next.translation.model = preset.defaultModel; })} /><ProviderModelField disabled={!settings.translation.enabled} endpoint={settings.translation.endpoint} fetch={providerFetch} fetchBlocked={fetchBlocked(translationBlocked)} label={t("translationModel")} provider="translation" t={t} value={settings.translation.model} onChange={(value) => update((next) => { next.translation.model = value; })} /><ApiKeyField configured={settings.translation.apiKeyConfigured} secret={secrets.translationApiKey} t={t} onChange={(secret) => updateSecret("translationApiKey", secret)} /></div><EndpointWarning blocked={translationBlocked} endpoint={settings.translation.endpoint} t={t} />{providerStatus("translation", secrets.translationApiKey)}</SettingsSection>
+    <SettingsSection action={providerAction("translation")} icon="text" title={t("translation")}><Toggle label={t("enableTranslation")} checked={settings.translation.enabled} onChange={(checked) => update((next) => { next.translation.enabled = checked; })} /><div class="form-grid"><SelectField disabled={!settings.translation.enabled} label={t("translationLanguage")} value={settings.translation.targetLanguage} onChange={(value) => update((next) => { next.translation.targetLanguage = value; })} options={[{ value: "Chinese", label: t("chinese") }, { value: "English", label: t("english") }, { value: "Japanese", label: t("japanese") }, { value: "Korean", label: t("korean") }]} /><ProviderEndpointFields disabled={!settings.translation.enabled} endpoint={settings.translation.endpoint} endpointLabel={t("translationEndpoint")} t={t} onEndpoint={(value) => update((next) => { next.translation.endpoint = value; })} onSelect={(preset) => update((next) => { next.translation.endpoint = preset.endpoint; next.translation.model = preset.defaultModel; })} /><ProviderModelField disabled={!settings.translation.enabled} endpoint={settings.translation.endpoint} fetch={providerFetch} fetchBlocked={fetchBlocked(providerKeys.blocked.translation)} label={t("translationModel")} provider="translation" t={t} value={settings.translation.model} onChange={(value) => update((next) => { next.translation.model = value; })} /><ProviderKeyField configured={settings.translation.apiKeyConfigured} keys={providerKeys} provider="translation" t={t} /></div><EndpointWarning blocked={providerKeys.blocked.translation} endpoint={settings.translation.endpoint} t={t} />{providerStatus("translation")}</SettingsSection>
 
-    <MeetingNotesProviderSection action={providerAction("meetingNotes", meetingNotesBlocked, secrets.meetingNotesApiKey)} blocked={meetingNotesBlocked} fetch={providerFetch} fetchBlocked={fetchBlocked(meetingNotesBlocked)} secret={secrets.meetingNotesApiKey} settings={settings} status={providerStatus("meetingNotes", secrets.meetingNotesApiKey)} t={t} update={update} onSecret={(secret) => updateSecret("meetingNotesApiKey", secret)} />
+    <MeetingNotesProviderSection action={providerAction("meetingNotes")} blocked={providerKeys.blocked.meetingNotes} fetch={providerFetch} fetchBlocked={fetchBlocked(providerKeys.blocked.meetingNotes)} keys={providerKeys} settings={settings} status={providerStatus("meetingNotes")} t={t} update={update} />
 
     <GlobalContextSection busy={busy} content={globalContext} notice={globalNotice} revision={globalRevision} save={saveGlobalContext} t={t} onChange={updateGlobalContext} />
 
     <SettingsSection icon="gear" title={t("desktop")}><Toggle label={t("hideOnClose")} checked={settings.desktop.hideWindowOnClose} onChange={(checked) => update((next) => { next.desktop.hideWindowOnClose = checked; })} /><Toggle label={t("launchAtLogin")} checked={settings.desktop.launchAtLogin} onChange={(checked) => update((next) => { next.desktop.launchAtLogin = checked; })} /><Toggle label={t("recordOnLaunch")} checked={settings.desktop.startRecordingOnLaunch} onChange={(checked) => update((next) => { next.desktop.startRecordingOnLaunch = checked; })} /></SettingsSection>
 
     <SettingsSection icon="gear" title={t("appearance")}><div class="form-grid"><SelectField label={t("theme")} value={settings.desktop.theme} onChange={(value) => update((next) => { next.desktop.theme = value as AppSettings["desktop"]["theme"]; })} options={[{ value: "system", label: t("themeSystem") }, { value: "light", label: t("themeLight") }, { value: "dark", label: t("themeDark") }]} /><SelectField label={t("language")} value={settings.desktop.language} onChange={(value) => update((next) => { next.desktop.language = value as AppSettings["desktop"]["language"]; })} options={[{ value: "system", label: t("langSystem") }, { value: "zh-CN", label: t("langChinese") }, { value: "en-US", label: t("langEnglish") }]} /></div></SettingsSection>
-    <div class="save-bar">{(translationBlocked || meetingNotesBlocked) && <p class="save-blocked">{t("insecureEndpointBlocked")}</p>}<button class="primary-button" disabled={busy || providerTest.running !== null || translationBlocked || meetingNotesBlocked} onClick={save}>{saved ? <><Icon name="check" />{t("saved")}</> : t("saveSettings")}</button></div>
+    <div class={`save-bar ${anyBlocked || saved ? "active" : ""}`}>{anyBlocked && <p class="save-blocked">{t("insecureEndpointBlocked")}</p>}<p aria-live="polite" class="save-state">{saved && <><Icon name="check" />{t("saved")}</>}</p></div>
   </div>;
 }
 

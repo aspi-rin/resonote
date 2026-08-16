@@ -22,6 +22,7 @@ import {
   type MeetingSummary,
   type ParticipantContext,
   type ProviderKind,
+  type ProviderSettingsView,
   type RunError,
   type SecretUpdate,
   type SessionAnalysisView,
@@ -112,11 +113,10 @@ export function isPlainRemoteEndpoint(endpoint: string) {
   }
 }
 
-export function secretBlocksSave(endpoint: string, configured: boolean, secret: SecretUpdate) {
-  if (!isPlainRemoteEndpoint(endpoint)) return false;
-  if (secret.action === "set") return secret.value.trim().length > 0;
-  if (secret.action === "clear") return false;
-  return configured;
+/** The one combination the backend refuses: a key that would travel to a remote
+ *  host in the clear. */
+export function secretBlocksSave(endpoint: string, apiKey: string) {
+  return isPlainRemoteEndpoint(endpoint) && apiKey.trim().length > 0;
 }
 
 export function contextCharacterCount(content: GlobalContextContent | MeetingContextContent) {
@@ -258,37 +258,50 @@ export const EMPTY_ENTITY: ContextEntity = { aliases: [], canonicalName: "", com
 export const EMPTY_GLOSSARY_ENTRY: GlossaryEntry = { aliases: [], commonAsrErrors: [], id: "", meaning: "", term: "" };
 export const EMPTY_PARTICIPANT: ParticipantContext = { ...EMPTY_ENTITY, role: "", speakerLabel: null };
 
-/** Placeholder content for a stored key: a constant, never a real secret, so the
- *  field can look filled while keys stay write-only. */
-export const KEY_SENTINEL = "••••••••";
-
-/** Maps what the input now holds onto the update the backend should receive.
- *  Emptying the field is how a stored key is cleared. */
-export function apiKeySecretFromInput(value: string, configured: boolean): SecretUpdate {
-  if (value === KEY_SENTINEL) return { action: "keep" };
-  const typed = value.replaceAll("•", "");
-  if (typed === "") return configured ? { action: "clear" } : { action: "keep" };
-  return { action: "set", value: typed };
+/** Turns the field value into the update the backend should receive, by diffing
+ *  it against the last key the backend confirmed. A visible key belongs to the
+ *  endpoint it is shown under, so moving the endpoint re-binds it; emptying the
+ *  field is how a stored key is cleared. */
+export function apiKeySecret(value: string, endpoint: string, confirmed: ProviderSettingsView): SecretUpdate {
+  const key = value.trim();
+  if (key === "") return confirmed.apiKey === "" ? { action: "keep" } : { action: "clear" };
+  if (key === confirmed.apiKey && normalizeEndpoint(endpoint) === normalizeEndpoint(confirmed.endpoint)) return { action: "keep" };
+  return { action: "set", value: key };
 }
 
-/** The eye only appears while a new value is being typed: the sentinel, an empty
- *  field and a pending clear have nothing to reveal, so a toggle there would
- *  swap one row of dots for another. */
-export function ApiKeyField({ configured, disabled = false, onChange, secret, t }: { configured: boolean; disabled?: boolean; onChange: (secret: SecretUpdate) => void; secret: SecretUpdate; t: Translate }) {
+/** The API key state of both providers, resolved by the App so one diff drives
+ *  the field, the save payload and the insecure-endpoint warning. */
+export interface ProviderKeyProps {
+  blocked: Record<ProviderKind, boolean>;
+  focus: (focused: boolean) => void;
+  secrets: Record<ProviderKind, SecretUpdate>;
+  update: (provider: ProviderKind, value: string) => void;
+  values: Record<ProviderKind, string>;
+}
+
+/** A plain text field: the settings view echoes the stored key back, so the eye
+ *  reveals the credential the next request would really send. Focus is reported
+ *  upwards because an autosave landing mid-edit would replace what is being
+ *  typed with the backend's answer. */
+export function ApiKeyField({ configured, disabled = false, onBlur, onChange, onFocus, secret, t, value }: { configured: boolean; disabled?: boolean; onBlur?: () => void; onChange: (value: string) => void; onFocus?: () => void; secret: SecretUpdate; t: Translate; value: string }) {
   const [revealed, setRevealed] = useState(false);
-  const typing = secret.action === "set";
-  const sentinel = secret.action === "keep" && configured;
-  const value = typing ? secret.value : sentinel ? KEY_SENTINEL : "";
+  const filled = value.length > 0;
   const chip = secret.action === "clear" ? "apiKeyWillClear" : configured ? "apiKeyStored" : "apiKeyNotStored";
-  useEffect(() => { if (!typing) setRevealed(false); }, [typing]);
+  useEffect(() => { if (!filled) setRevealed(false); }, [filled]);
   return <div class="field field-wide api-key-field">
     <span>{t("apiKey")}</span>
-    <div class={`api-key-row ${typing ? "has-reveal" : ""}`}>
-      <input autocomplete="off" disabled={disabled} placeholder={t("apiKeyPlaceholder")} spellcheck={false} type={typing && revealed ? "text" : "password"} value={value} onFocus={(event) => { if (sentinel) event.currentTarget.select(); }} onInput={(event) => onChange(apiKeySecretFromInput(event.currentTarget.value, configured))} />
-      {typing && <button aria-label={revealed ? t("apiKeyHide") : t("apiKeyShow")} class="api-key-reveal" disabled={disabled} type="button" onClick={() => setRevealed(!revealed)}><Icon name={revealed ? "eyeOff" : "eye"} /></button>}
+    <div class={`api-key-row ${filled ? "has-reveal" : ""}`}>
+      <input autocomplete="off" disabled={disabled} placeholder={t("apiKeyPlaceholder")} spellcheck={false} type={revealed ? "text" : "password"} value={value} onBlur={onBlur} onFocus={onFocus} onInput={(event) => onChange(event.currentTarget.value)} />
+      {filled && <button aria-label={revealed ? t("apiKeyHide") : t("apiKeyShow")} class="api-key-reveal" disabled={disabled} type="button" onClick={() => setRevealed(!revealed)}><Icon name={revealed ? "eyeOff" : "eye"} /></button>}
     </div>
     <p class={`api-key-note ${chip}`}>{t(chip)}</p>
   </div>;
+}
+
+/** The wired field: one line at both call sites, one place for the focus and
+ *  diff plumbing. */
+export function ProviderKeyField({ configured, disabled = false, keys, provider, t }: { configured: boolean; disabled?: boolean; keys: ProviderKeyProps; provider: ProviderKind; t: Translate }) {
+  return <ApiKeyField configured={configured} disabled={disabled} secret={keys.secrets[provider]} t={t} value={keys.values[provider]} onBlur={() => keys.focus(false)} onChange={(value) => keys.update(provider, value)} onFocus={() => keys.focus(true)} />;
 }
 
 /** The endpoint stays the source of truth — nothing new is persisted. Picking a
@@ -364,13 +377,13 @@ export function ProviderErrorNote({ error, state }: { error: string | null; stat
   return <p class="provider-status-note failed" role="alert"><i />{error}</p>;
 }
 
-export function MeetingNotesProviderSection({ action, blocked, fetch, fetchBlocked, onSecret, secret, settings, status, t, update }: { action: ComponentChildren; blocked: boolean; fetch: ProviderFetchProps; fetchBlocked: boolean; onSecret: (secret: SecretUpdate) => void; secret: SecretUpdate; settings: AppSettings; status: ComponentChildren; t: Translate; update: (mutate: (next: AppSettings) => void) => void }) {
+export function MeetingNotesProviderSection({ action, blocked, fetch, fetchBlocked, keys, settings, status, t, update }: { action: ComponentChildren; blocked: boolean; fetch: ProviderFetchProps; fetchBlocked: boolean; keys: ProviderKeyProps; settings: AppSettings; status: ComponentChildren; t: Translate; update: (mutate: (next: AppSettings) => void) => void }) {
   return <SettingsSection action={action} icon="chat" title={t("meetingNotesProvider")}>
     <p class="section-note">{t("meetingNotesProviderHint")}</p>
     <div class="form-grid">
       <ProviderEndpointFields endpoint={settings.meetingNotes.endpoint} endpointLabel={t("meetingNotesEndpoint")} t={t} onEndpoint={(value) => update((next) => { next.meetingNotes.endpoint = value; })} onSelect={(preset) => update((next) => { next.meetingNotes.endpoint = preset.endpoint; next.meetingNotes.model = preset.defaultModel; })} />
       <ProviderModelField endpoint={settings.meetingNotes.endpoint} fetch={fetch} fetchBlocked={fetchBlocked} label={t("meetingNotesModel")} provider="meetingNotes" t={t} value={settings.meetingNotes.model} onChange={(value) => update((next) => { next.meetingNotes.model = value; })} />
-      <ApiKeyField configured={settings.meetingNotes.apiKeyConfigured} secret={secret} t={t} onChange={onSecret} />
+      <ProviderKeyField configured={settings.meetingNotes.apiKeyConfigured} keys={keys} provider="meetingNotes" t={t} />
     </div>
     <EndpointWarning blocked={blocked} endpoint={settings.meetingNotes.endpoint} t={t} />
     {status}

@@ -177,3 +177,20 @@ describe("out-of-order status events", () => {
     expect(analysisStatusFromView(analysisView({ lastSuccessfulResult: analysisResult() })).state).toBe("complete");
   });
 });
+
+describe("history card actions", () => {
+  it("stacks delete, open folder and the detail toggle in that order", async () => {
+    scriptAppDefaults({ history: [historyEntry()], transcript: transcriptDocument() });
+    await renderApp(t);
+    openTab(t, "history");
+
+    const buttons = [...document.querySelectorAll<HTMLButtonElement>(".history-actions button")];
+    expect(buttons.map((button) => button.title)).toEqual([t("deleteRecording"), t("openFolder"), t("meetingNotes")]);
+    expect(buttons.map((button) => button.getAttribute("aria-expanded"))).toEqual([null, null, "false"]);
+
+    fireEvent.click(buttons[2]);
+
+    await screen.findByRole("tablist");
+    expect(document.querySelector(".history-actions button[aria-expanded]")?.getAttribute("aria-expanded")).toBe("true");
+  });
+});

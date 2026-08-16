@@ -1,14 +1,17 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/preact";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/preact";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { translator } from "../i18n";
-import { ApiKeyField, KEY_SENTINEL } from "../meeting_notes_ui";
+import { AUTOSAVE_DELAY_MS } from "../main";
+import { ApiKeyField, apiKeySecret, secretBlocksSave } from "../meeting_notes_ui";
 import { appSettings, errorPayload, scriptAppDefaults } from "../test/fixtures";
 import { openTab, renderApp, settingsSection, typeInto } from "../test/render";
 import { callsOf, lastCall, script, scriptFailure } from "../test/tauri";
-import type { AppSettingsWithoutSecrets, ProviderKind, SettingsSecretUpdates, TestProviderSettingsRequest } from "../types";
+import type { AppSettingsWithoutSecrets, ProviderKind, ProviderSettingsView, SettingsSecretUpdates, TestProviderSettingsRequest } from "../types";
 
 const t = translator("en-US");
-const LEAKED_KEY = "sk-stored-should-never-render";
+const STORED_KEY = "sk-stored-translation-key";
+
+afterEach(() => { vi.useRealTimers(); });
 
 function apiKeyInput(section: HTMLElement) {
   return within(section).getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement;
@@ -55,152 +58,221 @@ function testPill(section: HTMLElement) {
   return pill;
 }
 
-/** Present only while a new key is being typed, whichever way it is toggled. */
+/** Present whenever the field holds something to reveal. */
 function revealButton(section: HTMLElement) {
   return section.querySelector<HTMLButtonElement>("button.api-key-reveal");
 }
 
-describe("settings form", () => {
-  it("reads and saves the translation and meeting-notes providers independently", async () => {
+/** Settings with a stored translation key bound to the endpoint it is shown under. */
+function withStoredKey(endpoint = "http://127.0.0.1:8000/v1") {
+  return appSettings((next) => {
+    next.translation.apiKey = STORED_KEY;
+    next.translation.apiKeyConfigured = true;
+    next.translation.endpoint = endpoint;
+  });
+}
+
+/** Takes over the clock so the autosave debounce can be driven explicitly:
+ *  waitFor cannot advance vitest's fake timers, so every later step is awaited
+ *  through act instead. */
+function freezeClock() {
+  vi.useFakeTimers();
+}
+
+async function runDebounce(milliseconds = AUTOSAVE_DELAY_MS) {
+  await act(async () => { vi.advanceTimersByTime(milliseconds); });
+}
+
+describe("settings autosave", () => {
+  it("writes one save after a burst of edits and flashes the saved state", async () => {
     scriptAppDefaults({
       settings: appSettings((next) => {
         next.meetingNotes.endpoint = "http://127.0.0.1:9000/v1";
         next.meetingNotes.model = "qwen-max";
-        next.translation.endpoint = "http://127.0.0.1:8000/v1";
-        next.translation.model = "Hy-MT2-1.8B";
       }),
     });
     await renderApp(t);
     openTab(t, "settings");
-
-    expect((within(settingsSection(t("translation"))).getByLabelText(t("translationModel")) as HTMLInputElement).value).toBe("Hy-MT2-1.8B");
-    expect((within(settingsSection(t("meetingNotesProvider"))).getByLabelText(t("meetingNotesModel")) as HTMLInputElement).value).toBe("qwen-max");
+    freezeClock();
 
     typeInto(within(settingsSection(t("translation"))).getByLabelText(t("translationEndpoint")), "https://translate.example.com/v1");
     typeInto(within(settingsSection(t("meetingNotesProvider"))).getByLabelText(t("meetingNotesModel")), "gpt-5-mini");
-    typeInto(apiKeyInput(settingsSection(t("translation"))), "translation-secret");
-    typeInto(apiKeyInput(settingsSection(t("meetingNotesProvider"))), "notes-secret");
-    fireEvent.click(screen.getByRole("button", { name: t("saveSettings") }));
+    await runDebounce(AUTOSAVE_DELAY_MS - 100);
+    expect(callsOf("save_settings")).toHaveLength(0);
 
-    await waitFor(() => expect(callsOf("save_settings")).toHaveLength(1));
+    await runDebounce();
+
+    expect(callsOf("save_settings")).toHaveLength(1);
     const { secrets, settings } = savedPayload();
     expect(settings.translation.endpoint).toBe("https://translate.example.com/v1");
     expect(settings.translation.model).toBe("Hy-MT2-1.8B");
     expect(settings.meetingNotes.model).toBe("gpt-5-mini");
     expect(settings.meetingNotes.endpoint).toBe("http://127.0.0.1:9000/v1");
-    expect(secrets).toEqual({
-      meetingNotesApiKey: { action: "set", value: "notes-secret" },
-      translationApiKey: { action: "set", value: "translation-secret" },
-    });
+    expect(secrets).toEqual({ meetingNotesApiKey: { action: "keep" }, translationApiKey: { action: "keep" } });
+    expect(JSON.stringify(settings)).not.toContain("apiKey");
+    expect(JSON.stringify(settings)).not.toContain("verified");
+    expect(screen.getByText(t("saved"))).toBeTruthy();
   });
 
-  it("never sends apiKeyConfigured back to the backend", async () => {
-    scriptAppDefaults({ settings: appSettings((next) => { next.meetingNotes.apiKeyConfigured = true; next.translation.apiKeyConfigured = true; }) });
-    await renderApp(t);
-    openTab(t, "settings");
-    fireEvent.click(screen.getByRole("button", { name: t("saveSettings") }));
-
-    await waitFor(() => expect(callsOf("save_settings")).toHaveLength(1));
-    expect(JSON.stringify(savedPayload().settings)).not.toContain("apiKeyConfigured");
-  });
-
-  it("keeps both stored keys when the key inputs are untouched", async () => {
+  it("saves nothing while the form still matches the stored settings", async () => {
     scriptAppDefaults();
     await renderApp(t);
     openTab(t, "settings");
-    typeInto(within(settingsSection(t("meetingNotesProvider"))).getByLabelText(t("meetingNotesModel")), "gpt-5-mini");
-    fireEvent.click(screen.getByRole("button", { name: t("saveSettings") }));
+    freezeClock();
 
-    await waitFor(() => expect(callsOf("save_settings")).toHaveLength(1));
-    expect(savedPayload().secrets).toEqual({ meetingNotesApiKey: { action: "keep" }, translationApiKey: { action: "keep" } });
+    await runDebounce();
+
+    expect(callsOf("save_settings")).toHaveLength(0);
+  });
+
+  it("holds the save back while the key field has focus and flushes it on blur", async () => {
+    scriptAppDefaults();
+    await renderApp(t);
+    openTab(t, "settings");
+    freezeClock();
+    const input = apiKeyInput(settingsSection(t("meetingNotesProvider")));
+
+    fireEvent.focus(input);
+    typeInto(input, "notes-secret");
+    await runDebounce();
+    expect(callsOf("save_settings")).toHaveLength(0);
+    expect(apiKeyInput(settingsSection(t("meetingNotesProvider"))).value).toBe("notes-secret");
+
+    await act(async () => { fireEvent.blur(input); });
+
+    expect(callsOf("save_settings")).toHaveLength(1);
+    expect(savedPayload().secrets.meetingNotesApiKey).toEqual({ action: "set", value: "notes-secret" });
+    expect(within(settingsSection(t("meetingNotesProvider"))).getByText(t("apiKeyStored"))).toBeTruthy();
+  });
+
+  it("suspends the autosave while a key would travel to a remote host in the clear", async () => {
+    scriptAppDefaults({ settings: appSettings((next) => { next.meetingNotes.endpoint = "http://notes.example.com/v1"; }) });
+    await renderApp(t);
+    openTab(t, "settings");
+    freezeClock();
+
+    typeInto(apiKeyInput(settingsSection(t("meetingNotesProvider"))), "notes-secret");
+    await runDebounce();
+
+    expect(callsOf("save_settings")).toHaveLength(0);
+    expect(within(settingsSection(t("meetingNotesProvider"))).getByRole("alert").textContent).toContain(t("insecureEndpointBlocked"));
+    expect(screen.getByText(t("insecureEndpointBlocked"))).toBeTruthy();
+
+    typeInto(labelled(settingsSection(t("meetingNotesProvider")), t("meetingNotesEndpoint")), "https://notes.example.com/v1");
+    await runDebounce();
+
+    expect(callsOf("save_settings")).toHaveLength(1);
+    expect(savedPayload().secrets.meetingNotesApiKey).toEqual({ action: "set", value: "notes-secret" });
+    expect(screen.queryByText(t("insecureEndpointBlocked"))).toBeNull();
+  });
+
+  it("keeps the rejected form on screen and does not retry it", async () => {
+    scriptAppDefaults();
+    await renderApp(t);
+    openTab(t, "settings");
+    scriptFailure("save_settings", "invalid settings: meetingNotes endpoint must be a valid http or https URL");
+    freezeClock();
+
+    typeInto(within(settingsSection(t("meetingNotesProvider"))).getByLabelText(t("meetingNotesModel")), "gpt-5-mini");
+    await runDebounce();
+
+    expect(callsOf("save_settings")).toHaveLength(1);
+    expect(screen.getByText("invalid settings: meetingNotes endpoint must be a valid http or https URL")).toBeTruthy();
+    expect(labelled(settingsSection(t("meetingNotesProvider")), t("meetingNotesModel")).value).toBe("gpt-5-mini");
+
+    await runDebounce();
+
+    expect(callsOf("save_settings")).toHaveLength(1);
   });
 });
 
 describe("api key control", () => {
-  it("fills a configured field with the sentinel without ever rendering the stored value", async () => {
-    const settings = appSettings((next) => { next.meetingNotes.apiKeyConfigured = true; });
-    (settings.meetingNotes as unknown as Record<string, unknown>).apiKey = LEAKED_KEY;
-    scriptAppDefaults({ settings });
+  it("shows the stored key and reveals it on demand", async () => {
+    scriptAppDefaults({ settings: withStoredKey() });
     await renderApp(t);
     openTab(t, "settings");
 
-    const section = settingsSection(t("meetingNotesProvider"));
+    const section = settingsSection(t("translation"));
+    expect(apiKeyInput(section).value).toBe(STORED_KEY);
+    expect(apiKeyInput(section).type).toBe("password");
     expect(within(section).getByText(t("apiKeyStored"))).toBeTruthy();
-    expect(within(settingsSection(t("translation"))).getByText(t("apiKeyNotStored"))).toBeTruthy();
-    expect(document.body.textContent).not.toContain(LEAKED_KEY);
-    expect([...document.querySelectorAll("input")].map((input) => input.value)).not.toContain(LEAKED_KEY);
-    expect(apiKeyInput(section).value).toBe(KEY_SENTINEL);
-    expect(apiKeyInput(settingsSection(t("translation"))).value).toBe("");
-    expect(revealButton(section)).toBeNull();
-    expect(revealButton(settingsSection(t("translation")))).toBeNull();
 
-    typeInto(apiKeyInput(section), "fresh-key");
-    expect(revealButton(settingsSection(t("meetingNotesProvider")))).toBeTruthy();
+    fireEvent.click(revealButton(section) as HTMLButtonElement);
+
+    expect(apiKeyInput(settingsSection(t("translation"))).type).toBe("text");
+    expect(apiKeyInput(settingsSection(t("translation"))).value).toBe(STORED_KEY);
+    const empty = settingsSection(t("meetingNotesProvider"));
+    expect(apiKeyInput(empty).value).toBe("");
+    expect(revealButton(empty)).toBeNull();
+    expect(within(empty).getByText(t("apiKeyNotStored"))).toBeTruthy();
   });
 
-  it("emits set while typing and keep once an unconfigured input is emptied", () => {
+  it("clears a stored key once the field is emptied", async () => {
+    scriptAppDefaults({ settings: withStoredKey() });
+    await renderApp(t);
+    openTab(t, "settings");
+    freezeClock();
+
+    typeInto(apiKeyInput(settingsSection(t("translation"))), "");
+    expect(within(settingsSection(t("translation"))).getByText(t("apiKeyWillClear"))).toBeTruthy();
+    await runDebounce();
+
+    expect(savedPayload().secrets.translationApiKey).toEqual({ action: "clear" });
+    const section = settingsSection(t("translation"));
+    expect(apiKeyInput(section).value).toBe("");
+    expect(within(section).getByText(t("apiKeyNotStored"))).toBeTruthy();
+  });
+
+  it("re-binds a visible key to the endpoint it is shown under", async () => {
+    scriptAppDefaults({ settings: withStoredKey("https://first.example/v1") });
+    await renderApp(t);
+    openTab(t, "settings");
+    freezeClock();
+
+    typeInto(labelled(settingsSection(t("translation")), t("translationEndpoint")), "https://second.example/v1");
+    await runDebounce();
+
+    expect(savedPayload().secrets.translationApiKey).toEqual({ action: "set", value: STORED_KEY });
+    expect(apiKeyInput(settingsSection(t("translation"))).value).toBe(STORED_KEY);
+  });
+
+  it("maps the field against the confirmed key", () => {
+    const confirmed = (overrides: Partial<ProviderSettingsView> = {}): ProviderSettingsView => ({ apiKey: "", apiKeyConfigured: false, endpoint: "https://api.example.com/v1", model: "chat-model", verified: false, ...overrides });
+    const stored = confirmed({ apiKey: "stored-key", apiKeyConfigured: true });
+
+    expect(apiKeySecret("stored-key", "https://api.example.com/v1", stored)).toEqual({ action: "keep" });
+    expect(apiKeySecret("stored-key", " https://api.example.com/v1/ ", stored)).toEqual({ action: "keep" });
+    expect(apiKeySecret("rotated-key", "https://api.example.com/v1", stored)).toEqual({ action: "set", value: "rotated-key" });
+    expect(apiKeySecret("stored-key", "https://other.example.com/v1", stored)).toEqual({ action: "set", value: "stored-key" });
+    expect(apiKeySecret("  spaced-key  ", "https://api.example.com/v1", stored)).toEqual({ action: "set", value: "spaced-key" });
+    expect(apiKeySecret("", "https://api.example.com/v1", stored)).toEqual({ action: "clear" });
+    expect(apiKeySecret("   ", "https://api.example.com/v1", stored)).toEqual({ action: "clear" });
+    expect(apiKeySecret("", "https://api.example.com/v1", confirmed())).toEqual({ action: "keep" });
+    expect(apiKeySecret("fresh-key", "https://api.example.com/v1", confirmed())).toEqual({ action: "set", value: "fresh-key" });
+
+    expect(secretBlocksSave("http://notes.example.com/v1", "stored-key")).toBe(true);
+    expect(secretBlocksSave("http://notes.example.com/v1", "")).toBe(false);
+    expect(secretBlocksSave("http://127.0.0.1:8000/v1", "stored-key")).toBe(false);
+    expect(secretBlocksSave("https://notes.example.com/v1", "stored-key")).toBe(false);
+  });
+
+  it("reports every keystroke and both focus changes", () => {
+    const onBlur = vi.fn();
     const onChange = vi.fn();
-    render(<ApiKeyField configured={false} secret={{ action: "keep" }} t={t} onChange={onChange} />);
+    const onFocus = vi.fn();
+    render(<ApiKeyField configured={false} secret={{ action: "keep" }} t={t} value="" onBlur={onBlur} onChange={onChange} onFocus={onFocus} />);
     const input = screen.getByPlaceholderText(t("apiKeyPlaceholder"));
 
     typeInto(input, "fresh-key");
-    expect(onChange).toHaveBeenLastCalledWith({ action: "set", value: "fresh-key" });
-    typeInto(input, "");
-    expect(onChange).toHaveBeenLastCalledWith({ action: "keep" });
-  });
-
-  it("selects the sentinel on focus so one keystroke replaces it", () => {
-    const onChange = vi.fn();
-    render(<ApiKeyField configured={true} secret={{ action: "keep" }} t={t} onChange={onChange} />);
-    const input = screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement;
-    const select = vi.spyOn(input, "select");
-
-    expect(input.value).toBe(KEY_SENTINEL);
+    expect(onChange).toHaveBeenLastCalledWith("fresh-key");
     fireEvent.focus(input);
-    expect(select).toHaveBeenCalledTimes(1);
-    typeInto(input, "fresh-key");
-    expect(onChange).toHaveBeenLastCalledWith({ action: "set", value: "fresh-key" });
+    fireEvent.blur(input);
+    expect(onFocus).toHaveBeenCalledTimes(1);
+    expect(onBlur).toHaveBeenCalledTimes(1);
   });
 
-  it("strips the sentinel when the user types inside it", () => {
-    const onChange = vi.fn();
-    render(<ApiKeyField configured={true} secret={{ action: "keep" }} t={t} onChange={onChange} />);
-
-    typeInto(screen.getByPlaceholderText(t("apiKeyPlaceholder")), "••••fresh-key••••");
-    expect(onChange).toHaveBeenLastCalledWith({ action: "set", value: "fresh-key" });
-    typeInto(screen.getByPlaceholderText(t("apiKeyPlaceholder")), KEY_SENTINEL);
-    expect(onChange).toHaveBeenLastCalledWith({ action: "keep" });
-  });
-
-  it("clears a stored key when the field is emptied and stays editable afterwards", () => {
-    const onChange = vi.fn();
-    const view = render(<ApiKeyField configured={true} secret={{ action: "keep" }} t={t} onChange={onChange} />);
-    typeInto(screen.getByPlaceholderText(t("apiKeyPlaceholder")), "");
-    expect(onChange).toHaveBeenLastCalledWith({ action: "clear" });
-
-    view.rerender(<ApiKeyField configured={true} secret={{ action: "clear" }} t={t} onChange={onChange} />);
-    const input = screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement;
-    expect(screen.getByText(t("apiKeyWillClear"))).toBeTruthy();
-    expect(input.value).toBe("");
-    expect(input.disabled).toBe(false);
-    typeInto(input, "fresh-key");
-    expect(onChange).toHaveBeenLastCalledWith({ action: "set", value: "fresh-key" });
-  });
-
-  it("offers no eye while there is nothing but dots to reveal", () => {
-    const view = render(<ApiKeyField configured={true} secret={{ action: "keep" }} t={t} onChange={vi.fn()} />);
-    expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).value).toBe(KEY_SENTINEL);
-    expect(screen.queryByRole("button", { name: t("apiKeyShow") })).toBeNull();
-
-    view.rerender(<ApiKeyField configured={true} secret={{ action: "clear" }} t={t} onChange={vi.fn()} />);
-    expect(screen.queryByRole("button", { name: t("apiKeyShow") })).toBeNull();
-
-    view.rerender(<ApiKeyField configured={false} secret={{ action: "keep" }} t={t} onChange={vi.fn()} />);
-    expect(screen.queryByRole("button", { name: t("apiKeyShow") })).toBeNull();
-  });
-
-  it("toggles the typed value between password and text", () => {
-    render(<ApiKeyField configured={false} secret={{ action: "set", value: "typed-key" }} t={t} onChange={vi.fn()} />);
+  it("toggles the value between password and text", () => {
+    render(<ApiKeyField configured={true} secret={{ action: "keep" }} t={t} value="typed-key" onChange={vi.fn()} />);
     expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).type).toBe("password");
 
     fireEvent.click(screen.getByRole("button", { name: t("apiKeyShow") }));
@@ -212,22 +284,22 @@ describe("api key control", () => {
     expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).type).toBe("password");
   });
 
-  it("forgets the reveal when the typed value goes away", () => {
-    const view = render(<ApiKeyField configured={true} secret={{ action: "set", value: "typed-key" }} t={t} onChange={vi.fn()} />);
+  it("forgets the reveal when the value goes away", () => {
+    const view = render(<ApiKeyField configured={true} secret={{ action: "keep" }} t={t} value="typed-key" onChange={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: t("apiKeyShow") }));
     expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).type).toBe("text");
 
-    view.rerender(<ApiKeyField configured={true} secret={{ action: "clear" }} t={t} onChange={vi.fn()} />);
+    view.rerender(<ApiKeyField configured={true} secret={{ action: "clear" }} t={t} value="" onChange={vi.fn()} />);
     expect(screen.queryByRole("button", { name: t("apiKeyHide") })).toBeNull();
-    expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).type).toBe("password");
+    expect(screen.getByText(t("apiKeyWillClear"))).toBeTruthy();
 
-    view.rerender(<ApiKeyField configured={true} secret={{ action: "set", value: "another-key" }} t={t} onChange={vi.fn()} />);
+    view.rerender(<ApiKeyField configured={true} secret={{ action: "set", value: "another-key" }} t={t} value="another-key" onChange={vi.fn()} />);
     expect(screen.getByRole("button", { name: t("apiKeyShow") })).toBeTruthy();
     expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).type).toBe("password");
   });
 
   it("disables the input and the reveal button together", () => {
-    render(<ApiKeyField configured={true} disabled={true} secret={{ action: "set", value: "typed-key" }} t={t} onChange={vi.fn()} />);
+    render(<ApiKeyField configured={true} disabled={true} secret={{ action: "keep" }} t={t} value="typed-key" onChange={vi.fn()} />);
 
     expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: t("apiKeyShow") }) as HTMLButtonElement).disabled).toBe(true);
@@ -235,35 +307,37 @@ describe("api key control", () => {
 });
 
 describe("provider connection test", () => {
-  it("saves the whole form and marks the tested provider verified", async () => {
+  it("saves the whole form, marks the provider verified and cancels the pending autosave", async () => {
     scriptAppDefaults();
     await renderApp(t);
     openTab(t, "settings");
     const section = settingsSection(t("meetingNotesProvider"));
     expect(testPill(section).textContent).toContain(t("providerTestConnection"));
     expect(testPill(section).disabled).toBe(false);
+    freezeClock();
 
     typeInto(within(section).getByLabelText(t("meetingNotesModel")), "gpt-5-mini");
     typeInto(apiKeyInput(section), "notes-secret");
-    fireEvent.click(testPill(section));
+    await act(async () => { fireEvent.click(testPill(section)); });
 
-    await waitFor(() => expect(callsOf("test_provider_settings")).toHaveLength(1));
+    expect(callsOf("test_provider_settings")).toHaveLength(1);
     const request = testedPayload();
     expect(request.provider).toBe("meetingNotes");
     expect(request.settings.meetingNotes.model).toBe("gpt-5-mini");
     expect(request.secrets.meetingNotesApiKey).toEqual({ action: "set", value: "notes-secret" });
     expect(JSON.stringify(request.settings)).not.toContain("verified");
-    expect(JSON.stringify(request.settings)).not.toContain("apiKeyConfigured");
-    await waitFor(() => expect(testPill(settingsSection(t("meetingNotesProvider"))).textContent).toContain(t("providerVerified")));
-    expect(testPill(settingsSection(t("meetingNotesProvider"))).disabled).toBe(true);
-    expect(within(settingsSection(t("meetingNotesProvider"))).queryByRole("alert")).toBeNull();
-    expect(within(settingsSection(t("meetingNotesProvider"))).getByText(t("apiKeyStored"))).toBeTruthy();
-    expect(apiKeyInput(settingsSection(t("meetingNotesProvider"))).value).toBe(KEY_SENTINEL);
+    expect(JSON.stringify(request.settings)).not.toContain("apiKey");
+    const verified = settingsSection(t("meetingNotesProvider"));
+    expect(testPill(verified).textContent).toContain(t("providerVerified"));
+    expect(testPill(verified).disabled).toBe(true);
+    expect(within(verified).queryByRole("alert")).toBeNull();
+    expect(within(verified).getByText(t("apiKeyStored"))).toBeTruthy();
+    expect(apiKeyInput(verified).value).toBe("notes-secret");
     expect(testPill(settingsSection(t("translation"))).textContent).toContain(t("providerTestConnection"));
 
-    fireEvent.click(screen.getByRole("button", { name: t("saved") }));
-    await waitFor(() => expect(callsOf("save_settings")).toHaveLength(1));
-    expect(savedPayload().secrets).toEqual({ meetingNotesApiKey: { action: "keep" }, translationApiKey: { action: "keep" } });
+    await runDebounce();
+
+    expect(callsOf("save_settings")).toHaveLength(0);
   });
 
   it("reports a failed test without touching the stored settings", async () => {
@@ -311,12 +385,11 @@ describe("provider connection test", () => {
     expect(testPill(settingsSection(t("translation"))).disabled).toBe(true);
     expect(testPill(settingsSection(t("meetingNotesProvider"))).disabled).toBe(true);
     expect(fetchButton(settingsSection(t("translation"))).disabled).toBe(true);
-    expect((screen.getByRole("button", { name: t("saveSettings") }) as HTMLButtonElement).disabled).toBe(true);
     await waitFor(() => expect(callsOf("test_provider_settings")).toHaveLength(1));
   });
 
   it("cannot test a provider whose key would travel over plain remote http", async () => {
-    scriptAppDefaults({ settings: appSettings((next) => { next.translation.apiKeyConfigured = true; next.translation.endpoint = "http://notes.example.com/v1"; }) });
+    scriptAppDefaults({ settings: withStoredKey("http://notes.example.com/v1") });
     await renderApp(t);
     openTab(t, "settings");
 
@@ -393,19 +466,21 @@ describe("model discovery", () => {
     script("list_provider_models", () => ["deepseek-vl", "deepseek-reasoner"]);
     await renderApp(t);
     openTab(t, "settings");
+    freezeClock();
     typeInto(apiKeyInput(settingsSection(t("meetingNotesProvider"))), "notes-secret");
 
     fireEvent.click(fetchButton(settingsSection(t("meetingNotesProvider"))));
     expect(fetchButton(settingsSection(t("translation"))).disabled).toBe(true);
     expect(within(settingsSection(t("meetingNotesProvider"))).getByText(t("fetchingModels"))).toBeTruthy();
+    await act(async () => {});
 
-    await waitFor(() => expect(callsOf("list_provider_models")).toHaveLength(1));
+    expect(callsOf("list_provider_models")).toHaveLength(1);
     const request = fetchedPayload();
     expect(request.provider).toBe("meetingNotes");
     expect(request.settings.meetingNotes.endpoint).toBe("https://api.deepseek.com/v1");
     expect(request.secrets.meetingNotesApiKey).toEqual({ action: "set", value: "notes-secret" });
-    expect(JSON.stringify(request.settings)).not.toContain("apiKeyConfigured");
-    await waitFor(() => expect(suggestions("meetingNotes")).toEqual(["deepseek-chat", "deepseek-reasoner", "deepseek-vl"]));
+    expect(JSON.stringify(request.settings)).not.toContain("apiKey");
+    expect(suggestions("meetingNotes")).toEqual(["deepseek-chat", "deepseek-reasoner", "deepseek-vl"]);
     expect(suggestions("translation")).toEqual([]);
     expect(callsOf("save_settings")).toHaveLength(0);
   });
@@ -424,11 +499,10 @@ describe("model discovery", () => {
     expect(labelled(section, t("meetingNotesModel")).value).toBe("gpt-5-mini");
     expect(apiKeyInput(section).value).toBe("");
     expect(fetchButton(section).disabled).toBe(false);
-    expect(callsOf("save_settings")).toHaveLength(0);
   });
 
   it("cannot fetch while a connection test is in flight or a key would travel in the clear", async () => {
-    scriptAppDefaults({ settings: appSettings((next) => { next.translation.apiKeyConfigured = true; next.translation.endpoint = "http://notes.example.com/v1"; }) });
+    scriptAppDefaults({ settings: withStoredKey("http://notes.example.com/v1") });
     await renderApp(t);
     openTab(t, "settings");
     expect(fetchButton(settingsSection(t("translation"))).disabled).toBe(true);
@@ -447,39 +521,34 @@ describe("insecure endpoint", () => {
     scriptAppDefaults({ settings: appSettings((next) => { next.translation.endpoint = "http://notes.example.com/v1"; }) });
     await renderApp(t);
     openTab(t, "settings");
+    freezeClock();
 
     expect(within(settingsSection(t("translation"))).getByText(t("insecureEndpointWarning"), { exact: false })).toBeTruthy();
     expect(screen.queryByText(t("insecureEndpointBlocked"))).toBeNull();
-    expect((screen.getByRole("button", { name: t("saveSettings") }) as HTMLButtonElement).disabled).toBe(false);
+
+    typeInto(within(settingsSection(t("translation"))).getByLabelText(t("translationModel")), "other-model");
+    await runDebounce();
+
+    expect(callsOf("save_settings")).toHaveLength(1);
   });
 
-  it("blocks saving while a key would be sent over plain remote http", async () => {
-    scriptAppDefaults({
-      settings: appSettings((next) => {
-        next.translation.apiKeyConfigured = true;
-        next.translation.endpoint = "http://notes.example.com/v1";
-      }),
-    });
+  it("stops saving a stored key that the endpoint would expose", async () => {
+    scriptAppDefaults({ settings: withStoredKey("http://notes.example.com/v1") });
     await renderApp(t);
     openTab(t, "settings");
+    freezeClock();
 
     expect(within(settingsSection(t("translation"))).getByRole("alert").textContent).toContain(t("insecureEndpointBlocked"));
     expect(screen.getByText(t("insecureEndpointBlocked"))).toBeTruthy();
-    expect((screen.getByRole("button", { name: t("saveSettings") }) as HTMLButtonElement).disabled).toBe(true);
+    typeInto(within(settingsSection(t("translation"))).getByLabelText(t("translationModel")), "other-model");
+    await runDebounce();
+    expect(callsOf("save_settings")).toHaveLength(0);
 
     typeInto(apiKeyInput(settingsSection(t("translation"))), "");
-    expect((screen.getByRole("button", { name: t("saveSettings") }) as HTMLButtonElement).disabled).toBe(false);
+    await runDebounce();
+
     expect(screen.queryByText(t("insecureEndpointBlocked"))).toBeNull();
-  });
-
-  it("blocks saving a freshly typed key for a plain remote endpoint", async () => {
-    scriptAppDefaults({ settings: appSettings((next) => { next.meetingNotes.endpoint = "http://notes.example.com/v1"; }) });
-    await renderApp(t);
-    openTab(t, "settings");
-
-    expect((screen.getByRole("button", { name: t("saveSettings") }) as HTMLButtonElement).disabled).toBe(false);
-    typeInto(apiKeyInput(settingsSection(t("meetingNotesProvider"))), "notes-secret");
-    expect((screen.getByRole("button", { name: t("saveSettings") }) as HTMLButtonElement).disabled).toBe(true);
-    expect(callsOf("save_settings")).toHaveLength(0);
+    expect(callsOf("save_settings")).toHaveLength(1);
+    expect(savedPayload().secrets.translationApiKey).toEqual({ action: "clear" });
   });
 });

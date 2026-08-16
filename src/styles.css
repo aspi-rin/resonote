@@ -178,8 +178,8 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
 .transcript-resize::after { width: 44px; height: 4px; border-radius: 999px; background: color-mix(in srgb, var(--ink) 16%, transparent); content: ""; transition: background 140ms ease; }
 .transcript-resize:hover::after, .transcript-resize:focus-visible::after { background: var(--blue); }
 .transcript-resize:focus-visible { outline: none; }
-.secondary-button, .primary-button, .icon-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; padding: 0 13px; border: 1px solid var(--line); border-radius: 9px; color: var(--ink); background: var(--panel-raised); font-size: 10px; font-weight: 700; }
-.secondary-button.accent, .primary-button { border-color: var(--blue); color: white; background: var(--blue); }
+.secondary-button, .icon-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; padding: 0 13px; border: 1px solid var(--line); border-radius: 9px; color: var(--ink); background: var(--panel-raised); font-size: 10px; font-weight: 700; }
+.secondary-button.accent { border-color: var(--blue); color: white; background: var(--blue); }
 
 .view-actions { display: flex; align-items: center; justify-content: space-between; }
 .view-actions p { margin: 0; color: var(--muted); font-size: 11px; }
@@ -208,7 +208,7 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
 .folder-button { display: grid; width: 32px; height: 32px; place-items: center; border-radius: 9px; color: var(--muted); background: transparent; }
 .folder-button:hover { color: var(--blue); background: var(--blue-soft); }
 .folder-button .icon { width: 17px; }
-.history-actions { display: flex; gap: 3px; }
+.history-actions { display: flex; flex-direction: column; gap: 3px; }
 .delete-button:hover { color: var(--red); background: color-mix(in srgb, var(--red) 10%, transparent); }
 
 .settings-section { display: grid; gap: 15px; }
@@ -230,9 +230,12 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
 .path-row { display: flex; align-items: stretch; gap: 7px; }
 .path-row code { display: block; flex: 1 1 auto; min-width: 0; padding: 10px 11px; overflow: hidden; border: 1px solid var(--line); border-radius: 9px; color: var(--faint); background: color-mix(in srgb, var(--ink) 3%, transparent); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .path-row .icon-button { flex: 0 0 auto; white-space: nowrap; }
-.save-bar { position: sticky; bottom: 14px; z-index: 3; display: flex; justify-content: flex-end; padding: 10px; border: 1px solid var(--line); border-radius: 13px; background: color-mix(in srgb, var(--panel-solid) 88%, transparent); backdrop-filter: blur(15px); box-shadow: var(--shadow); }
-.primary-button { min-width: 130px; }
-.primary-button .icon { width: 15px; }
+/* Autosave leaves nothing to click, so the bar only reports: it fades in for a
+   saved flash or a blocked provider and stays out of the way otherwise. */
+.save-bar { position: sticky; bottom: 14px; z-index: 3; display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 13px; background: color-mix(in srgb, var(--panel-solid) 88%, transparent); backdrop-filter: blur(15px); box-shadow: var(--shadow); opacity: 0; pointer-events: none; transition: opacity 140ms ease; }
+.save-bar.active { opacity: 1; pointer-events: auto; }
+.save-state { display: inline-flex; align-items: center; gap: 6px; min-height: 20px; margin: 0; color: var(--green); font-size: 10px; font-weight: 700; }
+.save-state .icon { width: 15px; }
 
 .section-note { margin: -4px 0 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
 .inline-warning { margin: 0; padding: 9px 11px; border: 1px solid color-mix(in srgb, #d3a63a 40%, transparent); border-radius: 9px; color: #96701a; background: color-mix(in srgb, #d3a63a 10%, transparent); font-size: 10px; line-height: 1.6; text-wrap: pretty; }
@@ -380,8 +383,8 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
   .transcript-controls { flex: 1 1 auto; }
   .transcript-control { min-width: 0; flex: 1 1 0; }
   .transcript-control select { width: 100%; min-width: 0; }
-  .history-card { grid-template-columns: 52px 1fr; }
-  .history-actions { grid-column: 2; justify-self: end; margin-top: -36px; }
+  .history-card { grid-template-columns: 44px minmax(0, 1fr) auto; gap: 10px; padding: 13px; }
+  .history-date { padding-right: 9px; }
   .history-title { display: grid; gap: 4px; }
   .level-row { grid-template-columns: 78px 1fr 42px; gap: 8px; }
   .detail-panel { padding: 13px; }

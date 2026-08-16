@@ -272,19 +272,22 @@ export function scriptAppDefaults(options: AppScript = {}) {
   return { analysis, globalContext, settings };
 }
 
-/** Models the backend contract: keys are write-only, and a provider stays
+/** Models the backend contract: a stored key stays bound to the endpoint it was
+ *  set for and is echoed back only under that endpoint, and a provider stays
  *  verified only while its endpoint, model and key are untouched. */
 function persistedSettings(current: AppSettings, payload: AppSettingsWithoutSecrets, secrets: SettingsSecretUpdates, tested?: ProviderKind): AppSettings {
-  const configured = (stored: boolean, update: SecretUpdate) => {
-    if (update.action === "set") return update.value.trim().length > 0;
-    if (update.action === "clear") return false;
-    return stored;
+  const storedKey = (provider: ProviderKind) => {
+    const update: SecretUpdate = secrets[`${provider}ApiKey`];
+    if (update.action === "set") return update.value.trim();
+    if (update.action === "clear") return "";
+    return payload[provider].endpoint === current[provider].endpoint ? current[provider].apiKey : "";
   };
   const verified = (provider: ProviderKind) => provider === tested
     || (current[provider].verified && secrets[`${provider}ApiKey`].action === "keep" && payload[provider].endpoint === current[provider].endpoint && payload[provider].model === current[provider].model);
+  const provider = <T,>(kind: ProviderKind, values: T) => ({ ...values, apiKey: storedKey(kind), apiKeyConfigured: storedKey(kind).length > 0, verified: verified(kind) });
   return {
     ...payload,
-    meetingNotes: { ...payload.meetingNotes, apiKeyConfigured: configured(current.meetingNotes.apiKeyConfigured, secrets.meetingNotesApiKey), verified: verified("meetingNotes") },
-    translation: { ...payload.translation, apiKeyConfigured: configured(current.translation.apiKeyConfigured, secrets.translationApiKey), verified: verified("translation") },
+    meetingNotes: provider("meetingNotes", payload.meetingNotes),
+    translation: provider("translation", payload.translation),
   };
 }

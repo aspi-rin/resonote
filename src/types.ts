@@ -11,7 +11,10 @@ export interface VadConfig {
   minSpeechMs: number;
 }
 
+/** `apiKey` carries the stored key, but only while it is still bound to
+ *  `endpoint`; it is empty for every other provider state. */
 export interface ProviderSettingsView {
+  apiKey: string;
   apiKeyConfigured: boolean;
   endpoint: string;
   model: string;
@@ -61,8 +64,8 @@ export interface SettingsSecretUpdates {
 }
 
 export interface AppSettingsWithoutSecrets extends Omit<AppSettings, "meetingNotes" | "translation"> {
-  meetingNotes: Omit<AppSettings["meetingNotes"], "apiKeyConfigured" | "verified">;
-  translation: Omit<AppSettings["translation"], "apiKeyConfigured" | "verified">;
+  meetingNotes: Omit<AppSettings["meetingNotes"], "apiKey" | "apiKeyConfigured" | "verified">;
+  translation: Omit<AppSettings["translation"], "apiKey" | "apiKeyConfigured" | "verified">;
 }
 
 /** Shared by `test_provider_settings` and `list_provider_models`. */
@@ -537,6 +540,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     theme: "system",
   },
   meetingNotes: {
+    apiKey: "",
     apiKeyConfigured: false,
     endpoint: "http://127.0.0.1:8000/v1",
     maxInputCharacters: 48_000,
@@ -557,6 +561,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     },
   },
   translation: {
+    apiKey: "",
     apiKeyConfigured: false,
     enabled: true,
     endpoint: "http://127.0.0.1:8000/v1",

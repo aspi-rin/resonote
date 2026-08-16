@@ -285,9 +285,13 @@ pub struct AppSettings {
     pub translation: TranslationSettings,
 }
 
+/// The key travels back to the settings form in the clear: it already lives in
+/// plaintext in the private settings file, and echoing it lets the field show
+/// the credential the next request would actually send.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSettingsView {
+    pub api_key: String,
     pub api_key_configured: bool,
     pub endpoint: String,
     pub model: String,
@@ -393,23 +397,23 @@ impl AppSettings {
             desktop: self.desktop.clone(),
             meeting_notes: MeetingNotesSettingsView {
                 max_input_characters: self.meeting_notes.max_input_characters,
-                provider: ProviderSettingsView {
-                    api_key_configured: self.meeting_notes.credential_configured(),
-                    endpoint: self.meeting_notes.endpoint.clone(),
-                    model: self.meeting_notes.model.clone(),
-                    verified: self.meeting_notes.verified(),
-                },
+                provider: provider_view(
+                    &self.meeting_notes.endpoint,
+                    &self.meeting_notes.model,
+                    self.meeting_notes.bound_key(),
+                    self.meeting_notes.verified(),
+                ),
                 request_timeout_seconds: self.meeting_notes.request_timeout_seconds,
             },
             transcription: self.transcription.clone(),
             translation: TranslationSettingsView {
                 enabled: self.translation.enabled,
-                provider: ProviderSettingsView {
-                    api_key_configured: self.translation.credential_configured(),
-                    endpoint: self.translation.endpoint.clone(),
-                    model: self.translation.model.clone(),
-                    verified: self.translation.verified(),
-                },
+                provider: provider_view(
+                    &self.translation.endpoint,
+                    &self.translation.model,
+                    self.translation.bound_key(),
+                    self.translation.verified(),
+                ),
                 target_language: self.translation.target_language.clone(),
             },
         }
@@ -688,6 +692,25 @@ fn apply_secret(
     }
 }
 
+/// Only a key still bound to the endpoint being shown is echoed, so the field
+/// never displays a credential that a request from this form would not send.
+fn provider_view(
+    endpoint: &str,
+    model: &str,
+    bound_key: Option<&SecretString>,
+    verified: bool,
+) -> ProviderSettingsView {
+    ProviderSettingsView {
+        api_key: bound_key
+            .map(|key| key.trimmed().to_owned())
+            .unwrap_or_default(),
+        api_key_configured: bound_key.is_some(),
+        endpoint: endpoint.to_owned(),
+        model: model.to_owned(),
+        verified,
+    }
+}
+
 fn credential_configured(key: &SecretString, binding: &str, endpoint: &str) -> bool {
     !key.trimmed().is_empty()
         && !binding.is_empty()
@@ -941,7 +964,7 @@ mod tests {
         assert_eq!(view["translation"]["apiKeyConfigured"], false);
         assert_eq!(view["meetingNotes"]["apiKeyConfigured"], false);
         assert_eq!(view["meetingNotes"]["maxInputCharacters"], 48_000);
-        assert!(view["translation"].get("apiKey").is_none());
+        assert_eq!(view["translation"]["apiKey"], "");
     }
 
     #[test]
@@ -975,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_view_reports_a_configured_key_without_exposing_it() {
+    fn settings_view_echoes_the_key_bound_to_the_endpoint_it_shows() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
         let store = SettingsStore::open(path.clone()).unwrap();
@@ -983,14 +1006,16 @@ mod tests {
         let view = store
             .save(
                 without_secrets(&AppSettings::default()),
-                set_key("top-secret-key"),
+                set_key("  top-secret-key  "),
             )
             .unwrap();
 
         assert!(view.translation.provider.api_key_configured);
+        assert_eq!(view.translation.provider.api_key, "top-secret-key");
         assert!(!view.meeting_notes.provider.api_key_configured);
+        assert!(view.meeting_notes.provider.api_key.is_empty());
         let serialized = serde_json::to_string(&view).unwrap();
-        assert!(!serialized.contains("top-secret-key"));
+        assert!(serialized.contains("top-secret-key"));
         assert!(serialized.contains("\"apiKeyConfigured\":true"));
         assert!(
             fs::read_to_string(&path)
@@ -1010,6 +1035,7 @@ mod tests {
             .save(incoming.clone(), set_key("  first-key  "))
             .unwrap();
         assert!(view.translation.provider.api_key_configured);
+        assert_eq!(view.translation.provider.api_key, "first-key");
         assert_eq!(
             credentials
                 .translation_key("https://first.example/v1")
@@ -1024,6 +1050,7 @@ mod tests {
             .unwrap();
 
         assert!(!view.translation.provider.api_key_configured);
+        assert!(view.translation.provider.api_key.is_empty());
         assert!(
             credentials
                 .translation_key("https://second.example/v1")

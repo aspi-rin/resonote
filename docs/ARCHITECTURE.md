@@ -9,7 +9,7 @@ Resonote is designed to be a lightweight, local-first voice recorder and transcr
 - **Fail-safe Audio**: Main audio recording and file writes are decoupled from transcription. Transcription errors never disrupt recording.
 - **Fail-safe Translation**: Translation runs on its own persistent queue. Endpoint failures never block recording or ASR.
 - **Derived Meeting Notes**: Meeting notes are generated on demand from a finished transcript. The raw transcript stays read-only; every derived artifact lives in `analysis.json`.
-- **Structural Secret Isolation**: API keys exist only in the private stored settings. The types written to session files, returned over IPC, or hashed into fingerprints cannot carry a key.
+- **Structural Secret Isolation**: API keys exist only in the private stored settings and in the settings view that fills the settings form. The types written to session files, carried by events or errors, or hashed into fingerprints cannot carry a key.
 - **Crash Recovery**: Audio streams and session metadata (`session.json`) are checkpointed every 5 seconds. Atomic file writes prevent corruption.
 
 ## Data Flow
@@ -131,7 +131,7 @@ Workers check the tombstone under the lifecycle lock immediately before committi
 
 ## Secret Boundary
 
-- **Stored vs. view**: the settings store keeps the API keys privately. `get_settings` returns a view that reports an `apiKeyConfigured` flag per provider and never the value; `save_settings` accepts a secret-free settings payload plus explicit write-only key updates (keep, set, or clear).
+- **Stored vs. view**: the settings store keeps the API keys in the private settings file. `get_settings` returns a view that reports `apiKeyConfigured` per provider plus `apiKey`, which echoes the stored key only while it is still bound to the endpoint the view shows, so the settings form can display and reveal the credential the next request would send; `save_settings` accepts a secret-free settings payload plus explicit key updates (keep, set, or clear), which the form derives by diffing its field against the last confirmed key. No other IPC answer, event, document, or error payload carries a key.
 - **Connection test**: `test_provider_settings` merges the submitted form over the stored settings, sends one throwaway completion to that provider, and only then persists it, stamping a `verifiedFingerprint` over the normalized endpoint, the model, and a hash of the bound key. The view reports `verified` by recomputing that fingerprint, so changing any of the three drops the badge; a failed test persists nothing and returns the same structured error payload the meeting-notes pipeline uses.
 - **Model discovery**: `list_provider_models` takes the same request as the connection test, merges and validates it the same way, and issues one `GET {endpoint}/models` under the same transport rules. It persists nothing at all, and unlike the test it does not require a model — that is the point of the call — so the same structured error payload is the only thing that can come back besides the list of ids.
 - **Endpoint binding**: each key is stored together with the endpoint it was saved for. Pointing a provider at a different endpoint leaves the key unbound, the UI shows it as unconfigured, and no `Authorization` header is sent until the key is re-entered.
