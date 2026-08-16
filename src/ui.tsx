@@ -5,6 +5,8 @@ export type IconName =
   | "check"
   | "copy"
   | "download"
+  | "eye"
+  | "eyeOff"
   | "folder"
   | "gear"
   | "history"
@@ -25,6 +27,8 @@ export function Icon({ name }: { name: IconName }) {
     check: <path d="m5 12 4 4L19 6"/>,
     copy: <><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4V4h11v1"/></>,
     download: <><path d="M12 3v12m-5-5 5 5 5-5"/><path d="M5 20h14"/></>,
+    eye: <><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z"/><circle cx="12" cy="12" r="3"/></>,
+    eyeOff: <><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z"/><circle cx="12" cy="12" r="3"/><path d="m4 20 16-16"/></>,
     folder: <path d="M3 6h7l2 2h9v11H3z"/>,
     gear: <><circle cx="12" cy="12" r="3"/><path d="M19 13.5v-3l-2-.7-.7-1.7.9-1.9-2.1-2.1-1.9.9-1.7-.7L10.5 2h-3l-.7 2-1.7.7-1.9-.9-2.1 2.1.9 1.9-.7 1.7-2 .7v3l2 .7.7 1.7-.9 1.9 2.1 2.1 1.9-.9 1.7.7.7 2h3l.7-2 1.7-.7 1.9.9 2.1-2.1-.9-1.9.7-1.7z"/></>,
     history: <><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5m4-2v6l4 2"/></>,

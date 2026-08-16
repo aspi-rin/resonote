@@ -221,17 +221,29 @@ export const EMPTY_ENTITY: ContextEntity = { aliases: [], canonicalName: "", com
 export const EMPTY_GLOSSARY_ENTRY: GlossaryEntry = { aliases: [], commonAsrErrors: [], id: "", meaning: "", term: "" };
 export const EMPTY_PARTICIPANT: ParticipantContext = { ...EMPTY_ENTITY, role: "", speakerLabel: null };
 
+/** Placeholder content for a stored key: a constant, never a real secret, so the
+ *  field can look filled while keys stay write-only. */
+export const KEY_SENTINEL = "••••••••";
+
+/** Maps what the input now holds onto the update the backend should receive.
+ *  Emptying the field is how a stored key is cleared. */
+export function apiKeySecretFromInput(value: string, configured: boolean): SecretUpdate {
+  if (value === KEY_SENTINEL) return { action: "keep" };
+  const typed = value.replaceAll("•", "");
+  if (typed === "") return configured ? { action: "clear" } : { action: "keep" };
+  return { action: "set", value: typed };
+}
+
 export function ApiKeyField({ configured, disabled = false, onChange, secret, t }: { configured: boolean; disabled?: boolean; onChange: (secret: SecretUpdate) => void; secret: SecretUpdate; t: Translate }) {
   const [revealed, setRevealed] = useState(false);
-  const typed = secret.action === "set" ? secret.value : "";
-  const clearing = secret.action === "clear";
-  const chip = clearing ? "apiKeyWillClear" : configured ? "apiKeyStored" : "apiKeyNotStored";
+  const sentinel = secret.action === "keep" && configured;
+  const value = secret.action === "set" ? secret.value : sentinel ? KEY_SENTINEL : "";
+  const chip = secret.action === "clear" ? "apiKeyWillClear" : configured ? "apiKeyStored" : "apiKeyNotStored";
   return <div class="field field-wide api-key-field">
     <span>{t("apiKey")}</span>
     <div class="api-key-row">
-      <input autocomplete="off" disabled={disabled || clearing} placeholder={t("apiKeyPlaceholder")} spellcheck={false} type={revealed ? "text" : "password"} value={typed} onInput={(event) => onChange(event.currentTarget.value === "" ? { action: "keep" } : { action: "set", value: event.currentTarget.value })} />
-      <button class="icon-button" disabled={typed === ""} type="button" onClick={() => setRevealed(!revealed)}>{revealed ? t("apiKeyHide") : t("apiKeyShow")}</button>
-      <button class="icon-button" disabled={disabled} type="button" onClick={() => onChange(clearing ? { action: "keep" } : { action: "clear" })}>{clearing ? t("apiKeyUndoClear") : t("apiKeyClear")}</button>
+      <input autocomplete="off" disabled={disabled} placeholder={t("apiKeyPlaceholder")} spellcheck={false} type={revealed ? "text" : "password"} value={value} onFocus={(event) => { if (sentinel) event.currentTarget.select(); }} onInput={(event) => onChange(apiKeySecretFromInput(event.currentTarget.value, configured))} />
+      <button aria-label={revealed ? t("apiKeyHide") : t("apiKeyShow")} class="api-key-reveal" disabled={disabled} type="button" onClick={() => setRevealed(!revealed)}><Icon name={revealed ? "eyeOff" : "eye"} /></button>
     </div>
     <p class={`api-key-note ${chip}`}>{t(chip)}</p>
   </div>;

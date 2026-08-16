@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/preact";
 import { describe, expect, it, vi } from "vitest";
 import { translator } from "../i18n";
-import { ApiKeyField } from "../meeting_notes_ui";
+import { ApiKeyField, KEY_SENTINEL } from "../meeting_notes_ui";
 import { appSettings, errorPayload, scriptAppDefaults } from "../test/fixtures";
 import { openTab, renderApp, settingsSection, typeInto } from "../test/render";
 import { callsOf, lastCall, scriptFailure } from "../test/tauri";
@@ -87,7 +87,7 @@ describe("settings form", () => {
 });
 
 describe("api key control", () => {
-  it("marks a configured key without ever rendering its value", async () => {
+  it("fills a configured field with the sentinel without ever rendering the stored value", async () => {
     const settings = appSettings((next) => { next.meetingNotes.apiKeyConfigured = true; });
     (settings.meetingNotes as unknown as Record<string, unknown>).apiKey = LEAKED_KEY;
     scriptAppDefaults({ settings });
@@ -99,10 +99,11 @@ describe("api key control", () => {
     expect(within(settingsSection(t("translation"))).getByText(t("apiKeyNotStored"))).toBeTruthy();
     expect(document.body.textContent).not.toContain(LEAKED_KEY);
     expect([...document.querySelectorAll("input")].map((input) => input.value)).not.toContain(LEAKED_KEY);
-    expect(apiKeyInput(section).value).toBe("");
+    expect(apiKeyInput(section).value).toBe(KEY_SENTINEL);
+    expect(apiKeyInput(settingsSection(t("translation"))).value).toBe("");
   });
 
-  it("emits set while typing and keep once the input is emptied", () => {
+  it("emits set while typing and keep once an unconfigured input is emptied", () => {
     const onChange = vi.fn();
     render(<ApiKeyField configured={false} secret={{ action: "keep" }} t={t} onChange={onChange} />);
     const input = screen.getByPlaceholderText(t("apiKeyPlaceholder"));
@@ -113,29 +114,64 @@ describe("api key control", () => {
     expect(onChange).toHaveBeenLastCalledWith({ action: "keep" });
   });
 
-  it("clears and un-clears a stored key", () => {
+  it("selects the sentinel on focus so one keystroke replaces it", () => {
     const onChange = vi.fn();
-    const view = render(<ApiKeyField configured={true} secret={{ action: "keep" }} t={t} onChange={onChange} />);
-    fireEvent.click(screen.getByRole("button", { name: t("apiKeyClear") }));
-    expect(onChange).toHaveBeenLastCalledWith({ action: "clear" });
+    render(<ApiKeyField configured={true} secret={{ action: "keep" }} t={t} onChange={onChange} />);
+    const input = screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement;
+    const select = vi.spyOn(input, "select");
 
-    view.rerender(<ApiKeyField configured={true} secret={{ action: "clear" }} t={t} onChange={onChange} />);
-    expect(screen.getByText(t("apiKeyWillClear"))).toBeTruthy();
-    expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).disabled).toBe(true);
-    fireEvent.click(screen.getByRole("button", { name: t("apiKeyUndoClear") }));
+    expect(input.value).toBe(KEY_SENTINEL);
+    fireEvent.focus(input);
+    expect(select).toHaveBeenCalledTimes(1);
+    typeInto(input, "fresh-key");
+    expect(onChange).toHaveBeenLastCalledWith({ action: "set", value: "fresh-key" });
+  });
+
+  it("strips the sentinel when the user types inside it", () => {
+    const onChange = vi.fn();
+    render(<ApiKeyField configured={true} secret={{ action: "keep" }} t={t} onChange={onChange} />);
+
+    typeInto(screen.getByPlaceholderText(t("apiKeyPlaceholder")), "••••fresh-key••••");
+    expect(onChange).toHaveBeenLastCalledWith({ action: "set", value: "fresh-key" });
+    typeInto(screen.getByPlaceholderText(t("apiKeyPlaceholder")), KEY_SENTINEL);
     expect(onChange).toHaveBeenLastCalledWith({ action: "keep" });
   });
 
-  it("reveals only text the user typed", () => {
+  it("clears a stored key when the field is emptied and stays editable afterwards", () => {
+    const onChange = vi.fn();
+    const view = render(<ApiKeyField configured={true} secret={{ action: "keep" }} t={t} onChange={onChange} />);
+    typeInto(screen.getByPlaceholderText(t("apiKeyPlaceholder")), "");
+    expect(onChange).toHaveBeenLastCalledWith({ action: "clear" });
+
+    view.rerender(<ApiKeyField configured={true} secret={{ action: "clear" }} t={t} onChange={onChange} />);
+    const input = screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement;
+    expect(screen.getByText(t("apiKeyWillClear"))).toBeTruthy();
+    expect(input.value).toBe("");
+    expect(input.disabled).toBe(false);
+    typeInto(input, "fresh-key");
+    expect(onChange).toHaveBeenLastCalledWith({ action: "set", value: "fresh-key" });
+  });
+
+  it("toggles between password and text without revealing a stored key", () => {
     const view = render(<ApiKeyField configured={true} secret={{ action: "keep" }} t={t} onChange={vi.fn()} />);
-    expect((screen.getByRole("button", { name: t("apiKeyShow") }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).type).toBe("password");
+
+    fireEvent.click(screen.getByRole("button", { name: t("apiKeyShow") }));
+    const revealed = screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement;
+    expect(revealed.type).toBe("text");
+    expect(revealed.value).toBe(KEY_SENTINEL);
 
     view.rerender(<ApiKeyField configured={true} secret={{ action: "set", value: "typed-key" }} t={t} onChange={vi.fn()} />);
-    const input = screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement;
-    expect(input.type).toBe("password");
-    fireEvent.click(screen.getByRole("button", { name: t("apiKeyShow") }));
-    expect(input.type).toBe("text");
-    expect(input.value).toBe("typed-key");
+    expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).value).toBe("typed-key");
+    fireEvent.click(screen.getByRole("button", { name: t("apiKeyHide") }));
+    expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).type).toBe("password");
+  });
+
+  it("disables the input and the reveal button together", () => {
+    render(<ApiKeyField configured={true} disabled={true} secret={{ action: "keep" }} t={t} onChange={vi.fn()} />);
+
+    expect((screen.getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: t("apiKeyShow") }) as HTMLButtonElement).disabled).toBe(true);
   });
 });
 
@@ -160,7 +196,7 @@ describe("provider connection test", () => {
     expect(JSON.stringify(request.settings)).not.toContain("apiKeyConfigured");
     await screen.findByText(t("providerTestPassed"));
     expect(within(settingsSection(t("meetingNotesProvider"))).getByText(t("apiKeyStored"))).toBeTruthy();
-    expect(apiKeyInput(settingsSection(t("meetingNotesProvider"))).value).toBe("");
+    expect(apiKeyInput(settingsSection(t("meetingNotesProvider"))).value).toBe(KEY_SENTINEL);
     expect(within(settingsSection(t("translation"))).getByText(t("providerUnverified"))).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: t("saved") }));
@@ -219,7 +255,7 @@ describe("provider connection test", () => {
     expect(testButton(settingsSection(t("translation"))).disabled).toBe(true);
     expect(testButton(settingsSection(t("meetingNotesProvider"))).disabled).toBe(false);
 
-    fireEvent.click(within(settingsSection(t("translation"))).getByRole("button", { name: t("apiKeyClear") }));
+    typeInto(apiKeyInput(settingsSection(t("translation"))), "");
     expect(testButton(settingsSection(t("translation"))).disabled).toBe(false);
   });
 });
@@ -249,7 +285,7 @@ describe("insecure endpoint", () => {
     expect(screen.getByText(t("insecureEndpointBlocked"))).toBeTruthy();
     expect((screen.getByRole("button", { name: t("saveSettings") }) as HTMLButtonElement).disabled).toBe(true);
 
-    fireEvent.click(within(settingsSection(t("translation"))).getByRole("button", { name: t("apiKeyClear") }));
+    typeInto(apiKeyInput(settingsSection(t("translation"))), "");
     expect((screen.getByRole("button", { name: t("saveSettings") }) as HTMLButtonElement).disabled).toBe(false);
     expect(screen.queryByText(t("insecureEndpointBlocked"))).toBeNull();
   });

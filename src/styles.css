@@ -232,9 +232,11 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
 .section-note { margin: -4px 0 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
 .inline-warning { margin: 0; padding: 9px 11px; border: 1px solid color-mix(in srgb, #d3a63a 40%, transparent); border-radius: 9px; color: #96701a; background: color-mix(in srgb, #d3a63a 10%, transparent); font-size: 10px; line-height: 1.6; text-wrap: pretty; }
 .inline-warning.blocking { border-color: color-mix(in srgb, var(--red) 32%, transparent); color: var(--red); background: color-mix(in srgb, var(--red) 8%, transparent); }
-.api-key-field .api-key-row { display: flex; gap: 7px; }
-.api-key-field .api-key-row input { min-width: 0; flex: 1 1 auto; }
-.api-key-row .icon-button { flex: 0 0 auto; white-space: nowrap; }
+.api-key-field .api-key-row { position: relative; display: flex; }
+.api-key-field .api-key-row input { min-width: 0; flex: 1 1 auto; padding-right: 42px; }
+.api-key-reveal { position: absolute; top: 50%; right: 4px; display: grid; width: 32px; height: 32px; place-items: center; transform: translateY(-50%); border-radius: 9px; color: var(--muted); background: transparent; }
+.api-key-reveal:hover { color: var(--blue); background: var(--blue-soft); }
+.api-key-reveal .icon { width: 16px; height: 16px; }
 .api-key-note { margin: 0; color: var(--muted); font-size: 9px; font-weight: 700; line-height: 1.5; text-wrap: pretty; }
 .api-key-note.apiKeyWillClear { color: var(--red); }
 .provider-status { display: flex; align-items: center; gap: 11px; flex-wrap: wrap; }
@@ -374,8 +376,6 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
   .history-title { display: grid; gap: 4px; }
   .level-row { grid-template-columns: 78px 1fr 42px; gap: 8px; }
   .detail-panel { padding: 13px; }
-  .api-key-field .api-key-row { flex-wrap: wrap; }
-  .api-key-field .api-key-row input { flex: 1 1 100%; }
   .context-readonly > div { grid-template-columns: minmax(0, 1fr); gap: 2px; }
   .run-actions .secondary-button { flex: 1 1 auto; }
 }
