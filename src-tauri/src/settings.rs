@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
@@ -143,6 +144,7 @@ pub struct TranslationSettings {
     pub endpoint: String,
     pub model: String,
     pub target_language: String,
+    pub verified_fingerprint: String,
 }
 
 impl Default for TranslationSettings {
@@ -154,6 +156,7 @@ impl Default for TranslationSettings {
             endpoint: "http://127.0.0.1:8000/v1".to_owned(),
             model: "Hy-MT2-1.8B".to_owned(),
             target_language: "Chinese".to_owned(),
+            verified_fingerprint: String::new(),
         }
     }
 }
@@ -173,8 +176,22 @@ impl TranslationSettings {
         }
     }
 
-    fn credential_configured(&self) -> bool {
+    pub fn credential_configured(&self) -> bool {
         credential_configured(&self.api_key, &self.api_key_endpoint, &self.endpoint)
+    }
+
+    /// The stored key only counts while it is still bound to this endpoint, so
+    /// the fingerprint follows the same rule as `apiKeyConfigured`.
+    pub fn bound_key(&self) -> Option<&SecretString> {
+        self.credential_configured().then_some(&self.api_key)
+    }
+
+    fn fingerprint(&self) -> String {
+        provider_fingerprint(&self.endpoint, &self.model, self.bound_key())
+    }
+
+    fn verified(&self) -> bool {
+        !self.verified_fingerprint.is_empty() && self.verified_fingerprint == self.fingerprint()
     }
 }
 
@@ -187,6 +204,7 @@ pub struct MeetingNotesSettings {
     pub max_input_characters: u32,
     pub model: String,
     pub request_timeout_seconds: u32,
+    pub verified_fingerprint: String,
 }
 
 impl Default for MeetingNotesSettings {
@@ -198,6 +216,7 @@ impl Default for MeetingNotesSettings {
             max_input_characters: 48_000,
             model: String::new(),
             request_timeout_seconds: 180,
+            verified_fingerprint: String::new(),
         }
     }
 }
@@ -205,6 +224,18 @@ impl Default for MeetingNotesSettings {
 impl MeetingNotesSettings {
     pub fn credential_configured(&self) -> bool {
         credential_configured(&self.api_key, &self.api_key_endpoint, &self.endpoint)
+    }
+
+    pub fn bound_key(&self) -> Option<&SecretString> {
+        self.credential_configured().then_some(&self.api_key)
+    }
+
+    fn fingerprint(&self) -> String {
+        provider_fingerprint(&self.endpoint, &self.model, self.bound_key())
+    }
+
+    fn verified(&self) -> bool {
+        !self.verified_fingerprint.is_empty() && self.verified_fingerprint == self.fingerprint()
     }
 }
 
@@ -260,6 +291,15 @@ pub struct ProviderSettingsView {
     pub api_key_configured: bool,
     pub endpoint: String,
     pub model: String,
+    pub verified: bool,
+}
+
+/// Names the provider a connection test verifies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderKind {
+    MeetingNotes,
+    Translation,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -357,6 +397,7 @@ impl AppSettings {
                     api_key_configured: self.meeting_notes.credential_configured(),
                     endpoint: self.meeting_notes.endpoint.clone(),
                     model: self.meeting_notes.model.clone(),
+                    verified: self.meeting_notes.verified(),
                 },
                 request_timeout_seconds: self.meeting_notes.request_timeout_seconds,
             },
@@ -367,6 +408,7 @@ impl AppSettings {
                     api_key_configured: self.translation.credential_configured(),
                     endpoint: self.translation.endpoint.clone(),
                     model: self.translation.model.clone(),
+                    verified: self.translation.verified(),
                 },
                 target_language: self.translation.target_language.clone(),
             },
@@ -472,6 +514,12 @@ impl AppSettings {
 
 #[derive(Debug, Error)]
 pub enum SettingsError {
+    #[error("invalid settings: {0} endpoint must use https or a loopback host to store an API key")]
+    InsecureEndpoint(String),
+    #[error(
+        "invalid settings: {0} endpoint must be a valid http or https URL without embedded credentials"
+    )]
+    InvalidEndpoint(String),
     #[error("failed to access settings: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to parse settings: {0}")]
@@ -528,6 +576,39 @@ impl SettingsStore {
     ) -> Result<AppSettingsView, SettingsError> {
         let merged = self.snapshot().merge(settings, secrets);
         merged.validate()?;
+        self.commit(merged)
+    }
+
+    /// The candidate configuration a connection test runs against: validated,
+    /// but only persisted once the provider answered.
+    pub fn merge_for_test(
+        &self,
+        settings: AppSettingsWithoutSecrets,
+        secrets: SettingsSecretUpdates,
+    ) -> Result<AppSettings, SettingsError> {
+        let merged = self.snapshot().merge(settings, secrets);
+        merged.validate()?;
+        Ok(merged)
+    }
+
+    pub fn save_verified(
+        &self,
+        mut merged: AppSettings,
+        provider: ProviderKind,
+    ) -> Result<AppSettingsView, SettingsError> {
+        match provider {
+            ProviderKind::MeetingNotes => {
+                merged.meeting_notes.verified_fingerprint = merged.meeting_notes.fingerprint();
+            }
+            ProviderKind::Translation => {
+                merged.translation.verified_fingerprint = merged.translation.fingerprint();
+            }
+        }
+        merged.validate()?;
+        self.commit(merged)
+    }
+
+    fn commit(&self, merged: AppSettings) -> Result<AppSettingsView, SettingsError> {
         save_settings_atomic(&self.path, &merged)?;
         let view = merged.view();
         *self
@@ -627,17 +708,32 @@ fn validate_provider(
     api_key: &SecretString,
     api_key_endpoint: &str,
 ) -> Result<(), SettingsError> {
-    let url = chat_completions_url(endpoint).map_err(|_| {
-        SettingsError::Validation(format!(
-            "{name} endpoint must be a valid http or https URL without embedded credentials"
-        ))
-    })?;
+    let url = chat_completions_url(endpoint)
+        .map_err(|_| SettingsError::InvalidEndpoint(name.to_owned()))?;
     if credential_configured(api_key, api_key_endpoint, endpoint) && !allows_bearer_auth(&url) {
-        return Err(SettingsError::Validation(format!(
-            "{name} endpoint must use https or a loopback host to store an API key"
-        )));
+        return Err(SettingsError::InsecureEndpoint(name.to_owned()));
     }
     Ok(())
+}
+
+/// Identifies the exact provider configuration a connection test verified:
+/// endpoint, model and the key that would be sent with it. The key is hashed
+/// before it reaches the fingerprint, and an unusable endpoint fingerprints its
+/// raw form so it can never match a stored value.
+pub fn provider_fingerprint(
+    endpoint: &str,
+    model: &str,
+    bound_key: Option<&SecretString>,
+) -> String {
+    let endpoint = normalized_endpoint(endpoint).unwrap_or_else(|| endpoint.trim().to_owned());
+    let key = bound_key
+        .map(|key| sha256_hex(key.trimmed().as_bytes()))
+        .unwrap_or_default();
+    sha256_hex(format!("{endpoint}\n{}\n{key}", model.trim()).as_bytes())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn load_settings(path: &Path) -> Result<AppSettings, SettingsError> {
@@ -1054,6 +1150,117 @@ mod tests {
         }
         settings.meeting_notes.request_timeout_seconds = 900;
         settings.validate().unwrap();
+    }
+
+    #[test]
+    fn fingerprints_only_the_fields_a_connection_test_exercises() {
+        let mut settings = AppSettings::default();
+        let baseline = settings.translation.fingerprint();
+
+        settings.translation.target_language = "Japanese".to_owned();
+        settings.translation.enabled = false;
+        settings.meeting_notes.max_input_characters = 60_000;
+        assert_eq!(settings.translation.fingerprint(), baseline);
+
+        settings.translation.model = "other-model".to_owned();
+        assert_ne!(settings.translation.fingerprint(), baseline);
+
+        let mut settings = AppSettings::default();
+        settings.translation.endpoint = "https://provider.example/v1".to_owned();
+        assert_ne!(settings.translation.fingerprint(), baseline);
+
+        let mut settings = AppSettings::default();
+        settings.translation.api_key = SecretString::new("top-secret-key".to_owned());
+        settings.translation.api_key_endpoint =
+            normalized_endpoint(&settings.translation.endpoint).unwrap();
+        let with_key = settings.translation.fingerprint();
+        assert_ne!(with_key, baseline);
+        assert!(!with_key.contains("top-secret-key"));
+        settings.translation.api_key = SecretString::new("rotated-key".to_owned());
+        assert_ne!(settings.translation.fingerprint(), with_key);
+    }
+
+    #[test]
+    fn treats_a_trailing_slash_and_surrounding_space_as_the_same_endpoint() {
+        assert_eq!(
+            provider_fingerprint(" http://127.0.0.1:8000/v1/ ", " model ", None),
+            provider_fingerprint("http://127.0.0.1:8000/v1", "model", None)
+        );
+        assert_ne!(
+            provider_fingerprint("not a url", "model", None),
+            provider_fingerprint("http://127.0.0.1:8000/v1", "model", None)
+        );
+    }
+
+    #[test]
+    fn reports_older_configuration_files_as_unverified() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        for provider in ["meetingNotes", "translation"] {
+            value
+                .get_mut(provider)
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap()
+                .remove("verifiedFingerprint");
+        }
+
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+
+        assert!(settings.translation.verified_fingerprint.is_empty());
+        assert!(settings.meeting_notes.verified_fingerprint.is_empty());
+        let view = settings.view();
+        assert!(!view.translation.provider.verified);
+        assert!(!view.meeting_notes.provider.verified);
+    }
+
+    #[test]
+    fn saving_preserves_a_verified_provider_until_its_endpoint_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let store = SettingsStore::open(path.clone()).unwrap();
+        let incoming = without_secrets(&AppSettings::default());
+
+        let view = store
+            .save_verified(
+                store
+                    .merge_for_test(incoming.clone(), SettingsSecretUpdates::default())
+                    .unwrap(),
+                ProviderKind::Translation,
+            )
+            .unwrap();
+        assert!(view.translation.provider.verified);
+        assert!(!view.meeting_notes.provider.verified);
+        assert_eq!(SettingsStore::open(path).unwrap().view(), view);
+
+        let mut moved = incoming.clone();
+        moved.translation.endpoint = "https://provider.example/v1".to_owned();
+        let view = store.save(moved, SettingsSecretUpdates::default()).unwrap();
+        assert!(!view.translation.provider.verified);
+
+        let view = store
+            .save(incoming, SettingsSecretUpdates::default())
+            .unwrap();
+        assert!(view.translation.provider.verified);
+        assert!(!store.snapshot().translation.verified_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn storing_a_key_invalidates_a_verified_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::open(directory.path().join("settings.json")).unwrap();
+        let incoming = without_secrets(&AppSettings::default());
+        store
+            .save_verified(
+                store
+                    .merge_for_test(incoming.clone(), SettingsSecretUpdates::default())
+                    .unwrap(),
+                ProviderKind::Translation,
+            )
+            .unwrap();
+
+        let view = store.save(incoming, set_key("late-key")).unwrap();
+
+        assert!(view.translation.provider.api_key_configured);
+        assert!(!view.translation.provider.verified);
     }
 
     #[cfg(unix)]

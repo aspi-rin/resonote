@@ -2,10 +2,10 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/pre
 import { describe, expect, it, vi } from "vitest";
 import { translator } from "../i18n";
 import { ApiKeyField } from "../meeting_notes_ui";
-import { appSettings, scriptAppDefaults } from "../test/fixtures";
+import { appSettings, errorPayload, scriptAppDefaults } from "../test/fixtures";
 import { openTab, renderApp, settingsSection, typeInto } from "../test/render";
-import { callsOf, lastCall } from "../test/tauri";
-import type { AppSettingsWithoutSecrets, SettingsSecretUpdates } from "../types";
+import { callsOf, lastCall, scriptFailure } from "../test/tauri";
+import type { AppSettingsWithoutSecrets, SettingsSecretUpdates, TestProviderSettingsRequest } from "../types";
 
 const t = translator("en-US");
 const LEAKED_KEY = "sk-stored-should-never-render";
@@ -18,6 +18,16 @@ function savedPayload() {
   const call = lastCall("save_settings");
   if (!call) throw new Error("save_settings was not called");
   return { secrets: call.args.secrets as SettingsSecretUpdates, settings: call.args.settings as AppSettingsWithoutSecrets };
+}
+
+function testedPayload() {
+  const call = lastCall("test_provider_settings");
+  if (!call) throw new Error("test_provider_settings was not called");
+  return call.args.request as TestProviderSettingsRequest;
+}
+
+function testButton(section: HTMLElement) {
+  return within(section).getByRole("button", { name: t("providerTestConnection") }) as HTMLButtonElement;
 }
 
 describe("settings form", () => {
@@ -85,8 +95,8 @@ describe("api key control", () => {
     openTab(t, "settings");
 
     const section = settingsSection(t("meetingNotesProvider"));
-    expect(within(section).getByText(t("apiKeyConfigured"))).toBeTruthy();
-    expect(within(settingsSection(t("translation"))).getByText(t("apiKeyMissing"))).toBeTruthy();
+    expect(within(section).getByText(t("apiKeyStored"))).toBeTruthy();
+    expect(within(settingsSection(t("translation"))).getByText(t("apiKeyNotStored"))).toBeTruthy();
     expect(document.body.textContent).not.toContain(LEAKED_KEY);
     expect([...document.querySelectorAll("input")].map((input) => input.value)).not.toContain(LEAKED_KEY);
     expect(apiKeyInput(section).value).toBe("");
@@ -126,6 +136,91 @@ describe("api key control", () => {
     fireEvent.click(screen.getByRole("button", { name: t("apiKeyShow") }));
     expect(input.type).toBe("text");
     expect(input.value).toBe("typed-key");
+  });
+});
+
+describe("provider connection test", () => {
+  it("saves the whole form and marks the tested provider verified", async () => {
+    scriptAppDefaults();
+    await renderApp(t);
+    openTab(t, "settings");
+    const section = settingsSection(t("meetingNotesProvider"));
+    expect(within(section).getByText(t("providerUnverified"))).toBeTruthy();
+
+    typeInto(within(section).getByLabelText(t("meetingNotesModel")), "gpt-5-mini");
+    typeInto(apiKeyInput(section), "notes-secret");
+    fireEvent.click(testButton(section));
+
+    await waitFor(() => expect(callsOf("test_provider_settings")).toHaveLength(1));
+    const request = testedPayload();
+    expect(request.provider).toBe("meetingNotes");
+    expect(request.settings.meetingNotes.model).toBe("gpt-5-mini");
+    expect(request.secrets.meetingNotesApiKey).toEqual({ action: "set", value: "notes-secret" });
+    expect(JSON.stringify(request.settings)).not.toContain("verified");
+    expect(JSON.stringify(request.settings)).not.toContain("apiKeyConfigured");
+    await screen.findByText(t("providerTestPassed"));
+    expect(within(settingsSection(t("meetingNotesProvider"))).getByText(t("apiKeyStored"))).toBeTruthy();
+    expect(apiKeyInput(settingsSection(t("meetingNotesProvider"))).value).toBe("");
+    expect(within(settingsSection(t("translation"))).getByText(t("providerUnverified"))).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: t("saved") }));
+    await waitFor(() => expect(callsOf("save_settings")).toHaveLength(1));
+    expect(savedPayload().secrets).toEqual({ meetingNotesApiKey: { action: "keep" }, translationApiKey: { action: "keep" } });
+  });
+
+  it("reports a failed test without touching the stored settings", async () => {
+    scriptAppDefaults({ settings: appSettings((next) => { next.translation.model = "Hy-MT2-1.8B"; }) });
+    await renderApp(t);
+    openTab(t, "settings");
+    scriptFailure("test_provider_settings", errorPayload({ code: "PROVIDER_UNAUTHORIZED", messageKey: "meetingNotesErrorProviderUnauthorized", retryable: false }));
+
+    fireEvent.click(testButton(settingsSection(t("translation"))));
+
+    await screen.findByText(t("meetingNotesErrorProviderUnauthorized"));
+    const section = settingsSection(t("translation"));
+    expect(within(section).getByRole("alert").textContent).toBe(t("meetingNotesErrorProviderUnauthorized"));
+    expect(within(section).queryByText(t("providerVerified"))).toBeNull();
+    expect((within(section).getByLabelText(t("translationModel")) as HTMLInputElement).value).toBe("Hy-MT2-1.8B");
+    expect(callsOf("save_settings")).toHaveLength(0);
+  });
+
+  it("drops the verified badge as soon as the endpoint is edited", async () => {
+    scriptAppDefaults({ settings: appSettings((next) => { next.translation.verified = true; }) });
+    await renderApp(t);
+    openTab(t, "settings");
+    expect(within(settingsSection(t("translation"))).getByText(t("providerVerified"))).toBeTruthy();
+
+    typeInto(within(settingsSection(t("translation"))).getByLabelText(t("translationEndpoint")), "https://translate.example.com/v1");
+
+    expect(within(settingsSection(t("translation"))).getByText(t("providerUnverified"))).toBeTruthy();
+    expect(within(settingsSection(t("meetingNotesProvider"))).getByText(t("providerUnverified"))).toBeTruthy();
+  });
+
+  it("runs one request per click and locks the other buttons while it is in flight", async () => {
+    scriptAppDefaults();
+    await renderApp(t);
+    openTab(t, "settings");
+    const button = testButton(settingsSection(t("translation")));
+
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    expect(button.disabled).toBe(true);
+    expect(testButton(settingsSection(t("meetingNotesProvider"))).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: t("saveSettings") }) as HTMLButtonElement).disabled).toBe(true);
+    await waitFor(() => expect(callsOf("test_provider_settings")).toHaveLength(1));
+  });
+
+  it("cannot test a provider whose key would travel over plain remote http", async () => {
+    scriptAppDefaults({ settings: appSettings((next) => { next.translation.apiKeyConfigured = true; next.translation.endpoint = "http://notes.example.com/v1"; }) });
+    await renderApp(t);
+    openTab(t, "settings");
+
+    expect(testButton(settingsSection(t("translation"))).disabled).toBe(true);
+    expect(testButton(settingsSection(t("meetingNotesProvider"))).disabled).toBe(false);
+
+    fireEvent.click(within(settingsSection(t("translation"))).getByRole("button", { name: t("apiKeyClear") }));
+    expect(testButton(settingsSection(t("translation"))).disabled).toBe(false);
   });
 });
 

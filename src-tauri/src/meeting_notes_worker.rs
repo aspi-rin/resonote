@@ -13,7 +13,7 @@ use crate::{
         CleanResult, CleanedPart, CleanedSegment, DOCUMENT_NAME, InputQuality, InputQualityKind,
         InputSnapshot, MeetingNotesDocument, MeetingNotesError, MeetingNotesErrorCode,
         MeetingNotesRun, MeetingSummary, RunError, RunProgress, RunStage, SourceSessionStatus,
-        SourceTranscriptStatus, SummaryMode, load_document, save_document,
+        SourceTranscriptStatus, SummaryMode, chat_error_code, load_document, save_document,
     },
     meeting_notes_pipeline::{
         CLEAN_SYSTEM_PROMPT, SummaryPlan, SummaryScope, chat_messages, clean_user_message,
@@ -21,7 +21,7 @@ use crate::{
         parse_summary_response, plan_clean_chunks, plan_reduce_groups, plan_summary,
         reassemble_clean_result, reduce_user_message, summary_system_prompt, summary_user_message,
     },
-    openai_compatible::{ChatError, ChatRequest},
+    openai_compatible::ChatRequest,
 };
 
 use super::{
@@ -780,24 +780,6 @@ fn attempt_retryable(code: MeetingNotesErrorCode) -> bool {
             | MeetingNotesErrorCode::ProviderUnavailable
             | MeetingNotesErrorCode::SummaryOutputInvalid
     )
-}
-
-fn chat_error_code(error: &ChatError) -> MeetingNotesErrorCode {
-    match error {
-        ChatError::Forbidden => MeetingNotesErrorCode::ProviderForbidden,
-        ChatError::InsecureEndpoint => MeetingNotesErrorCode::InsecureEndpoint,
-        ChatError::InvalidEndpoint { .. } | ChatError::UnexpectedStatus(_) => {
-            MeetingNotesErrorCode::InvalidEndpoint
-        }
-        ChatError::ProviderResponseInvalid => MeetingNotesErrorCode::ProviderResponseInvalid,
-        ChatError::RateLimited(_) => MeetingNotesErrorCode::ProviderRateLimited,
-        ChatError::RequestFailed | ChatError::Unavailable(_) => {
-            MeetingNotesErrorCode::ProviderUnavailable
-        }
-        ChatError::ResponseTooLarge => MeetingNotesErrorCode::ResponseTooLarge,
-        ChatError::Timeout => MeetingNotesErrorCode::ProviderTimeout,
-        ChatError::Unauthorized => MeetingNotesErrorCode::ProviderUnauthorized,
-    }
 }
 
 fn committed_count<T>(units: &[CheckpointUnit<T>]) -> u32 {

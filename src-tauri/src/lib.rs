@@ -17,6 +17,7 @@ pub mod meeting_notes_pipeline;
 mod model_package;
 pub mod models;
 pub mod openai_compatible;
+pub mod provider_check;
 pub mod recording;
 pub mod session_catalog;
 pub mod session_lifecycle;
@@ -36,6 +37,8 @@ use meeting_notes_document::{
     VersionedMeetingContext,
 };
 use models::{ModelCatalogEntry, ModelDownloadStatus, ModelManager};
+use openai_compatible::ReqwestChatClient;
+use provider_check::TestProviderRequest;
 use recording::{RecordingService, RecordingStatus};
 use session_catalog::SessionCatalog;
 use session_lifecycle::SessionLifecycle;
@@ -110,6 +113,23 @@ fn save_settings(
         .map_err(|error| error.to_string())?;
     tray.update_language(saved.desktop.language);
     Ok(saved)
+}
+
+/// Runs one real completion against the submitted configuration and only
+/// persists it — verified — once the provider answered.
+#[tauri::command]
+async fn test_provider_settings(
+    app: tauri::AppHandle,
+    request: TestProviderRequest,
+) -> Result<AppSettingsView, MeetingNotesErrorPayload> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let chat =
+            ReqwestChatClient::new().map_err(|error| MeetingNotesError::io().with_source(error))?;
+        provider_check::test_provider(&app.state::<SettingsStore>(), &chat, request)
+    })
+    .await
+    .map_err(|error| report_meeting_notes_error(MeetingNotesError::io().with_source(error)))?
+    .map_err(report_meeting_notes_error)
 }
 
 #[tauri::command]
@@ -533,7 +553,8 @@ pub fn run() {
             set_recording_languages,
             set_recording_source,
             start_recording,
-            stop_recording
+            stop_recording,
+            test_provider_settings
         ])
         .build(tauri::generate_context!())
         .expect("failed to run Resonote")

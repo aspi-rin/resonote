@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { format, type TranslationKey, type translator } from "./i18n";
 import { Icon, isTauri, NumberField, SettingsSection, TextField, formatClock, formatDuration } from "./ui";
@@ -20,6 +21,7 @@ import {
   type MeetingNotesStatusEvent,
   type MeetingSummary,
   type ParticipantContext,
+  type ProviderKind,
   type RunError,
   type SecretUpdate,
   type SessionAnalysisView,
@@ -31,6 +33,16 @@ import {
 
 export type Translate = ReturnType<typeof translator>;
 export type DetailTab = "transcript" | "cleaned" | "summary" | "context";
+export type ProviderTestState = "failed" | "testing" | "unverified" | "verified";
+
+/** Everything the settings view needs to render and run a connection test. */
+export interface ProviderTestProps {
+  confirmed: AppSettings;
+  errors: Record<ProviderKind, string | null>;
+  passed: ProviderKind | null;
+  running: ProviderKind | null;
+  test: (provider: ProviderKind) => void;
+}
 
 /** Ordering metadata shared by the status event and the read view. */
 export interface AnalysisStatus {
@@ -213,7 +225,7 @@ export function ApiKeyField({ configured, disabled = false, onChange, secret, t 
   const [revealed, setRevealed] = useState(false);
   const typed = secret.action === "set" ? secret.value : "";
   const clearing = secret.action === "clear";
-  const chip = clearing ? "apiKeyWillClear" : configured ? "apiKeyConfigured" : "apiKeyMissing";
+  const chip = clearing ? "apiKeyWillClear" : configured ? "apiKeyStored" : "apiKeyNotStored";
   return <div class="field field-wide api-key-field">
     <span>{t("apiKey")}</span>
     <div class="api-key-row">
@@ -221,7 +233,7 @@ export function ApiKeyField({ configured, disabled = false, onChange, secret, t 
       <button class="icon-button" disabled={typed === ""} type="button" onClick={() => setRevealed(!revealed)}>{revealed ? t("apiKeyHide") : t("apiKeyShow")}</button>
       <button class="icon-button" disabled={disabled} type="button" onClick={() => onChange(clearing ? { action: "keep" } : { action: "clear" })}>{clearing ? t("apiKeyUndoClear") : t("apiKeyClear")}</button>
     </div>
-    <p class={`api-key-note ${chip}`}><i />{t(chip)}</p>
+    <p class={`api-key-note ${chip}`}>{t(chip)}</p>
   </div>;
 }
 
@@ -230,7 +242,27 @@ export function EndpointWarning({ blocked, endpoint, t }: { blocked: boolean; en
   return <p class={`inline-warning ${blocked ? "blocking" : ""}`} role={blocked ? "alert" : undefined}>{t("insecureEndpointWarning")}{blocked ? ` ${t("insecureEndpointBlocked")}` : ""}</p>;
 }
 
-export function MeetingNotesProviderSection({ blocked, onSecret, secret, settings, t, update }: { blocked: boolean; onSecret: (secret: SecretUpdate) => void; secret: SecretUpdate; settings: AppSettings; t: Translate; update: (mutate: (next: AppSettings) => void) => void }) {
+/** An edit the backend has not confirmed yet: only the fields the connection
+ *  test exercises count, so a language or budget change stays verified. */
+export function providerDirty(settings: AppSettings, confirmed: AppSettings, provider: ProviderKind, secret: SecretUpdate) {
+  return secret.action !== "keep" || settings[provider].endpoint !== confirmed[provider].endpoint || settings[provider].model !== confirmed[provider].model;
+}
+
+export function providerTestState({ dirty, failed, testing, verified }: { dirty: boolean; failed: boolean; testing: boolean; verified: boolean }): ProviderTestState {
+  if (testing) return "testing";
+  if (verified && !dirty) return "verified";
+  return failed ? "failed" : "unverified";
+}
+
+export function ProviderStatusRow({ disabled, error, passed, state, t, test }: { disabled: boolean; error: string | null; passed: boolean; state: ProviderTestState; t: Translate; test: () => void }) {
+  const label = state === "failed" && error ? error : t(state === "testing" ? "providerTesting" : state !== "verified" ? "providerUnverified" : passed ? "providerTestPassed" : "providerVerified");
+  return <div class="provider-status">
+    <button class="icon-button" disabled={disabled || state === "testing"} type="button" onClick={test}>{t("providerTestConnection")}</button>
+    <p class={`provider-status-note ${state}`} role={state === "failed" ? "alert" : undefined}><i />{label}</p>
+  </div>;
+}
+
+export function MeetingNotesProviderSection({ blocked, onSecret, secret, settings, status, t, update }: { blocked: boolean; onSecret: (secret: SecretUpdate) => void; secret: SecretUpdate; settings: AppSettings; status: ComponentChildren; t: Translate; update: (mutate: (next: AppSettings) => void) => void }) {
   return <SettingsSection icon="chat" title={t("meetingNotesProvider")}>
     <p class="section-note">{t("meetingNotesProviderHint")}</p>
     <div class="form-grid">
@@ -239,6 +271,7 @@ export function MeetingNotesProviderSection({ blocked, onSecret, secret, setting
       <ApiKeyField configured={settings.meetingNotes.apiKeyConfigured} secret={secret} t={t} onChange={onSecret} />
     </div>
     <EndpointWarning blocked={blocked} endpoint={settings.meetingNotes.endpoint} t={t} />
+    {status}
     <details class="advanced-settings">
       <summary>{t("advancedSettings")}</summary>
       <div class="form-grid">

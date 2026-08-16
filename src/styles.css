@@ -235,11 +235,14 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
 .api-key-field .api-key-row { display: flex; gap: 7px; }
 .api-key-field .api-key-row input { min-width: 0; flex: 1 1 auto; }
 .api-key-row .icon-button { flex: 0 0 auto; white-space: nowrap; }
-.api-key-note { display: inline-flex; align-items: center; gap: 6px; margin: 0; color: var(--muted); font-size: 9px; font-weight: 700; }
-.api-key-note i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.api-key-note.apiKeyConfigured { color: var(--green); }
-.api-key-note.apiKeyMissing { color: var(--faint); }
+.api-key-note { margin: 0; color: var(--muted); font-size: 9px; font-weight: 700; line-height: 1.5; text-wrap: pretty; }
 .api-key-note.apiKeyWillClear { color: var(--red); }
+.provider-status { display: flex; align-items: center; gap: 11px; flex-wrap: wrap; }
+.provider-status .icon-button { flex: 0 0 auto; white-space: nowrap; }
+.provider-status-note { display: inline-flex; align-items: center; gap: 6px; min-width: 0; margin: 0; color: var(--faint); font-size: 10px; font-weight: 700; line-height: 1.5; text-wrap: pretty; }
+.provider-status-note i { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: currentColor; }
+.provider-status-note.verified { color: var(--green); }
+.provider-status-note.failed { color: var(--red); }
 .advanced-settings { border: 1px solid var(--line); border-radius: 10px; background: color-mix(in srgb, var(--ink) 2%, transparent); }
 .advanced-settings summary { padding: 10px 12px; color: var(--muted); font-size: 10px; font-weight: 700; cursor: pointer; }
 .advanced-settings[open] summary { border-bottom: 1px solid var(--line); }

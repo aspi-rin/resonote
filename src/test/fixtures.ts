@@ -18,9 +18,11 @@ import {
   type MeetingNotesRunView,
   type MeetingNotesStatusEvent,
   type MeetingSummary,
+  type ProviderKind,
   type SecretUpdate,
   type SessionAnalysisView,
   type SettingsSecretUpdates,
+  type TestProviderSettingsRequest,
   type TranscriptDocument,
   type TranscriptSegment,
 } from "../types";
@@ -263,18 +265,26 @@ export function scriptAppDefaults(options: AppScript = {}) {
   script("save_session_context", (args) => ({ content: args.content, revision: analysis.meetingContext.revision + 1, updatedAt: STARTED_AT }));
   script("save_global_context", (args) => ({ content: args.content, revision: globalContext.revision + 1, schemaVersion: 1, updatedAt: STARTED_AT }));
   script("save_settings", (args) => persistedSettings(settings, args.settings as AppSettingsWithoutSecrets, args.secrets as SettingsSecretUpdates));
+  script("test_provider_settings", (args) => {
+    const request = args.request as TestProviderSettingsRequest;
+    return persistedSettings(settings, request.settings, request.secrets, request.provider);
+  });
   return { analysis, globalContext, settings };
 }
 
-function persistedSettings(current: AppSettings, payload: AppSettingsWithoutSecrets, secrets: SettingsSecretUpdates): AppSettings {
+/** Models the backend contract: keys are write-only, and a provider stays
+ *  verified only while its endpoint, model and key are untouched. */
+function persistedSettings(current: AppSettings, payload: AppSettingsWithoutSecrets, secrets: SettingsSecretUpdates, tested?: ProviderKind): AppSettings {
   const configured = (stored: boolean, update: SecretUpdate) => {
     if (update.action === "set") return update.value.trim().length > 0;
     if (update.action === "clear") return false;
     return stored;
   };
+  const verified = (provider: ProviderKind) => provider === tested
+    || (current[provider].verified && secrets[`${provider}ApiKey`].action === "keep" && payload[provider].endpoint === current[provider].endpoint && payload[provider].model === current[provider].model);
   return {
     ...payload,
-    meetingNotes: { ...payload.meetingNotes, apiKeyConfigured: configured(current.meetingNotes.apiKeyConfigured, secrets.meetingNotesApiKey) },
-    translation: { ...payload.translation, apiKeyConfigured: configured(current.translation.apiKeyConfigured, secrets.translationApiKey) },
+    meetingNotes: { ...payload.meetingNotes, apiKeyConfigured: configured(current.meetingNotes.apiKeyConfigured, secrets.meetingNotesApiKey), verified: verified("meetingNotes") },
+    translation: { ...payload.translation, apiKeyConfigured: configured(current.translation.apiKeyConfigured, secrets.translationApiKey), verified: verified("translation") },
   };
 }

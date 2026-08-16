@@ -117,6 +117,7 @@ fn provider_settings() -> MeetingNotesSettings {
         max_input_characters: 48_000,
         model: "local-model".to_owned(),
         request_timeout_seconds: 180,
+        verified_fingerprint: String::new(),
     }
 }
 

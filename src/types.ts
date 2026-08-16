@@ -15,7 +15,10 @@ export interface ProviderSettingsView {
   apiKeyConfigured: boolean;
   endpoint: string;
   model: string;
+  verified: boolean;
 }
+
+export type ProviderKind = "meetingNotes" | "translation";
 
 export interface AppSettings {
   audio: {
@@ -58,8 +61,14 @@ export interface SettingsSecretUpdates {
 }
 
 export interface AppSettingsWithoutSecrets extends Omit<AppSettings, "meetingNotes" | "translation"> {
-  meetingNotes: Omit<AppSettings["meetingNotes"], "apiKeyConfigured">;
-  translation: Omit<AppSettings["translation"], "apiKeyConfigured">;
+  meetingNotes: Omit<AppSettings["meetingNotes"], "apiKeyConfigured" | "verified">;
+  translation: Omit<AppSettings["translation"], "apiKeyConfigured" | "verified">;
+}
+
+export interface TestProviderSettingsRequest {
+  provider: ProviderKind;
+  secrets: SettingsSecretUpdates;
+  settings: AppSettingsWithoutSecrets;
 }
 
 export interface RecordingStatus {
@@ -532,6 +541,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     maxInputCharacters: 48_000,
     model: "",
     requestTimeoutSeconds: 180,
+    verified: false,
   },
   transcription: {
     language: "auto",
@@ -551,6 +561,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     endpoint: "http://127.0.0.1:8000/v1",
     model: "Hy-MT2-1.8B",
     targetLanguage: "Chinese",
+    verified: false,
   },
 };
 

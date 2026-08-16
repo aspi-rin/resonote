@@ -12,7 +12,9 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{session_catalog::CatalogError, settings::ProviderAuthMode};
+use crate::{
+    openai_compatible::ChatError, session_catalog::CatalogError, settings::ProviderAuthMode,
+};
 
 pub const DOCUMENT_NAME: &str = "analysis.json";
 pub const GLOBAL_CONTEXT_CHARACTER_LIMIT: usize = 20_000;
@@ -950,6 +952,26 @@ impl MeetingNotesErrorCode {
 impl std::fmt::Display for MeetingNotesErrorCode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+/// Shared by the notes worker and the settings connection test so both report a
+/// provider failure under the same code.
+pub fn chat_error_code(error: &ChatError) -> MeetingNotesErrorCode {
+    match error {
+        ChatError::Forbidden => MeetingNotesErrorCode::ProviderForbidden,
+        ChatError::InsecureEndpoint => MeetingNotesErrorCode::InsecureEndpoint,
+        ChatError::InvalidEndpoint { .. } | ChatError::UnexpectedStatus(_) => {
+            MeetingNotesErrorCode::InvalidEndpoint
+        }
+        ChatError::ProviderResponseInvalid => MeetingNotesErrorCode::ProviderResponseInvalid,
+        ChatError::RateLimited(_) => MeetingNotesErrorCode::ProviderRateLimited,
+        ChatError::RequestFailed | ChatError::Unavailable(_) => {
+            MeetingNotesErrorCode::ProviderUnavailable
+        }
+        ChatError::ResponseTooLarge => MeetingNotesErrorCode::ResponseTooLarge,
+        ChatError::Timeout => MeetingNotesErrorCode::ProviderTimeout,
+        ChatError::Unauthorized => MeetingNotesErrorCode::ProviderUnauthorized,
     }
 }
 

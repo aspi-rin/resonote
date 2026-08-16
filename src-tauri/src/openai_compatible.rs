@@ -270,9 +270,76 @@ impl ChatError {
 
 #[cfg(test)]
 pub mod test_support {
-    use std::{collections::VecDeque, sync::Mutex, time::Duration};
+    use std::{
+        collections::VecDeque,
+        io::{Read, Write},
+        net::{SocketAddr, TcpListener, TcpStream},
+        sync::Mutex,
+        thread::{self, JoinHandle},
+        time::Duration,
+    };
 
     use super::{ChatCompletionPort, ChatError, ChatRequest};
+
+    /// Answers exactly one chat request and hands the raw request text back, so
+    /// a test can assert on the headers the client actually sent.
+    pub struct ScriptedServer {
+        pub address: SocketAddr,
+        pub handle: JoinHandle<String>,
+    }
+
+    pub fn serve_once(response: String) -> ScriptedServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = read_request(&mut stream);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+            request
+        });
+        ScriptedServer { address, handle }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 2_048];
+        while let Ok(count) = stream.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = request.windows(4).position(|item| item == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    pub fn json_response(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
 
     #[derive(Clone)]
     pub struct RecordedChatRequest {
