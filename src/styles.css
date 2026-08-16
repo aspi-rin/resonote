@@ -111,6 +111,7 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
 .field select, .field input { width: 100%; height: 40px; min-height: 40px; padding: 0 11px; border: 1px solid var(--line); border-radius: 10px; outline: none; color: var(--ink); background: var(--panel-raised); font-size: 11px; }
 .field select:focus, .field input:focus { border-color: color-mix(in srgb, var(--blue) 55%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 10%, transparent); }
 .field select:disabled, .field input:disabled { color: var(--faint); background: color-mix(in srgb, var(--ink) 3%, var(--panel-raised)); cursor: not-allowed; opacity: 0.65; }
+.field input:read-only { color: var(--muted); background: color-mix(in srgb, var(--ink) 3%, var(--panel-raised)); }
 .field-wide { grid-column: 1 / -1; }
 .field input[type="number"] { appearance: textfield; -moz-appearance: textfield; }
 .field input[type="number"]::-webkit-inner-spin-button, .field input[type="number"]::-webkit-outer-spin-button { margin: 0; -webkit-appearance: none; }
@@ -239,6 +240,12 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: 0.55; }
 .api-key-reveal .icon { width: 16px; height: 16px; }
 .api-key-note { margin: 0; color: var(--muted); font-size: 9px; font-weight: 700; line-height: 1.5; text-wrap: pretty; }
 .api-key-note.apiKeyWillClear { color: var(--red); }
+.model-field .model-row { display: flex; gap: 7px; }
+.model-field .model-row input { min-width: 0; flex: 1 1 auto; }
+.model-refresh { flex: 0 0 auto; width: 40px; min-height: 40px; padding: 0; }
+.model-refresh .icon { width: 15px; height: 15px; }
+.model-note { margin: 0; color: var(--muted); font-size: 9px; font-weight: 700; line-height: 1.5; text-wrap: pretty; }
+.model-note.failed { color: var(--red); }
 .provider-status { display: flex; align-items: center; gap: 11px; flex-wrap: wrap; }
 .provider-status .icon-button { flex: 0 0 auto; white-space: nowrap; }
 .provider-status-note { display: inline-flex; align-items: center; gap: 6px; min-width: 0; margin: 0; color: var(--faint); font-size: 10px; font-weight: 700; line-height: 1.5; text-wrap: pretty; }

@@ -1,7 +1,13 @@
 use super::{
-    test_support::{ScriptedChatClient, json_response, serve_once},
+    test_support::{ScriptedChatClient, ScriptedModelLister, json_response, serve_once},
     *,
 };
+
+fn list_models(endpoint: &str, api_key: Option<&SecretString>) -> Result<Vec<String>, ChatError> {
+    ReqwestChatClient::new()
+        .unwrap()
+        .list_models(ModelListRequest { api_key, endpoint })
+}
 
 fn complete(endpoint: &str, api_key: Option<&SecretString>) -> Result<String, ChatError> {
     ReqwestChatClient::new().unwrap().complete(ChatRequest {
@@ -236,6 +242,140 @@ fn maps_http_status_codes_to_stable_errors() {
     ));
     assert!(!classify_status(StatusCode::UNAUTHORIZED).retryable());
     assert!(classify_status(StatusCode::BAD_GATEWAY).retryable());
+}
+
+#[test]
+fn builds_models_url_from_base_or_full_endpoint() {
+    assert_eq!(
+        models_url("http://127.0.0.1:8000/v1").unwrap().as_str(),
+        "http://127.0.0.1:8000/v1/models"
+    );
+    assert_eq!(
+        models_url("http://localhost:8000/v1/chat/completions/")
+            .unwrap()
+            .as_str(),
+        "http://localhost:8000/v1/models"
+    );
+    assert_eq!(
+        models_url("https://example.com").unwrap().as_str(),
+        "https://example.com/models"
+    );
+    assert_eq!(
+        models_url("  https://example.com/v1?key=value#part  ")
+            .unwrap()
+            .as_str(),
+        "https://example.com/v1/models"
+    );
+    for endpoint in [
+        "http://user:password@example.com/v1",
+        "http://user@example.com/v1",
+        "ftp://example.com/v1",
+        "example.com/v1",
+        "",
+    ] {
+        assert!(
+            matches!(
+                models_url(endpoint),
+                Err(ChatError::InvalidEndpoint { status: None })
+            ),
+            "{endpoint} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn gets_the_models_path_with_the_bearer_token_and_parses_the_ids() {
+    let server = serve_once(json_response(
+        "200 OK",
+        r#"{"object":"list","data":[{"id":"deepseek-reasoner","object":"model"},{"id":"deepseek-chat"}]}"#,
+    ));
+    let endpoint = format!("http://{}/v1", server.address);
+
+    let models = list_models(&endpoint, Some(&SecretString::new("  secret  ".to_owned()))).unwrap();
+
+    let request = server.handle.join().unwrap();
+    assert_eq!(models, vec!["deepseek-chat", "deepseek-reasoner"]);
+    assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+    assert!(request.contains("authorization: Bearer secret\r\n"));
+}
+
+#[test]
+fn omits_authorization_from_the_models_request_when_no_key_is_bound() {
+    let server = serve_once(json_response("200 OK", r#"{"data":[]}"#));
+    let endpoint = format!("http://{}/v1", server.address);
+
+    let models = list_models(&endpoint, Some(&SecretString::new("   ".to_owned()))).unwrap();
+
+    let request = server.handle.join().unwrap();
+    assert!(models.is_empty());
+    assert!(!request.to_ascii_lowercase().contains("authorization"));
+}
+
+#[test]
+fn refuses_to_list_models_over_remote_plain_http_with_a_key() {
+    let error = list_models(
+        "http://192.0.2.10:8000/v1",
+        Some(&SecretString::new("secret".to_owned())),
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, ChatError::InsecureEndpoint));
+}
+
+#[test]
+fn dedupes_sorts_and_skips_unusable_model_ids() {
+    let body = r#"{"data":[{"id":"gamma"},{"id":"alpha"},{"id":"gamma"},{"id":""},{"id":"  beta  "},{"object":"model"},{"id":null}]}"#;
+
+    assert_eq!(
+        parse_model_ids(body).unwrap(),
+        vec!["alpha", "beta", "gamma"]
+    );
+    assert!(parse_model_ids(r#"{"data":[]}"#).unwrap().is_empty());
+}
+
+#[test]
+fn rejects_unusable_models_payloads() {
+    for body in [
+        "",
+        "not json",
+        "{}",
+        r#"{"data":{}}"#,
+        r#"{"models":[{"id":"alpha"}]}"#,
+        r#"{"data":[{"id":42}]}"#,
+    ] {
+        assert!(
+            matches!(
+                parse_model_ids(body),
+                Err(ChatError::ProviderResponseInvalid)
+            ),
+            "{body} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn scripted_lister_replays_results_in_call_order() {
+    let lister = ScriptedModelLister::new(vec![
+        Ok(vec!["alpha".to_owned()]),
+        Err(ChatError::Unauthorized),
+    ]);
+    let key = SecretString::new(" secret ".to_owned());
+
+    let first = lister.list_models(ModelListRequest {
+        api_key: Some(&key),
+        endpoint: "http://127.0.0.1:8000/v1",
+    });
+    let second = lister.list_models(ModelListRequest {
+        api_key: None,
+        endpoint: "https://example.com/v1",
+    });
+
+    assert_eq!(first.unwrap(), vec!["alpha"]);
+    assert!(matches!(second, Err(ChatError::Unauthorized)));
+    let requests = lister.requests();
+    assert_eq!(requests[0].api_key.as_deref(), Some("secret"));
+    assert_eq!(requests[1].endpoint, "https://example.com/v1");
+    assert!(requests[1].api_key.is_none());
 }
 
 #[test]

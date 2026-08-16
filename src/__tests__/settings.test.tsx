@@ -4,14 +4,36 @@ import { translator } from "../i18n";
 import { ApiKeyField, KEY_SENTINEL } from "../meeting_notes_ui";
 import { appSettings, errorPayload, scriptAppDefaults } from "../test/fixtures";
 import { openTab, renderApp, settingsSection, typeInto } from "../test/render";
-import { callsOf, lastCall, scriptFailure } from "../test/tauri";
-import type { AppSettingsWithoutSecrets, SettingsSecretUpdates, TestProviderSettingsRequest } from "../types";
+import { callsOf, lastCall, script, scriptFailure } from "../test/tauri";
+import type { AppSettingsWithoutSecrets, ProviderKind, SettingsSecretUpdates, TestProviderSettingsRequest } from "../types";
 
 const t = translator("en-US");
 const LEAKED_KEY = "sk-stored-should-never-render";
 
 function apiKeyInput(section: HTMLElement) {
   return within(section).getByPlaceholderText(t("apiKeyPlaceholder")) as HTMLInputElement;
+}
+
+function labelled(section: HTMLElement, label: string) {
+  return within(section).getByLabelText(label) as HTMLInputElement;
+}
+
+function presetSelect(section: HTMLElement) {
+  return within(section).getByLabelText(t("providerPreset")) as HTMLSelectElement;
+}
+
+function fetchButton(section: HTMLElement) {
+  return within(section).getByRole("button", { name: t("fetchModels") }) as HTMLButtonElement;
+}
+
+function suggestions(provider: ProviderKind) {
+  return [...document.querySelectorAll<HTMLOptionElement>(`#provider-models-${provider} option`)].map((option) => option.value);
+}
+
+function fetchedPayload() {
+  const call = lastCall("list_provider_models");
+  if (!call) throw new Error("list_provider_models was not called");
+  return call.args.request as TestProviderSettingsRequest;
 }
 
 function savedPayload() {
@@ -257,6 +279,120 @@ describe("provider connection test", () => {
 
     typeInto(apiKeyInput(settingsSection(t("translation"))), "");
     expect(testButton(settingsSection(t("translation"))).disabled).toBe(false);
+  });
+});
+
+describe("provider presets", () => {
+  it("derives the selection from the endpoint and tolerates a trailing slash", async () => {
+    scriptAppDefaults({
+      settings: appSettings((next) => {
+        next.meetingNotes.endpoint = "https://api.deepseek.com/v1/";
+        next.translation.endpoint = "https://translate.example.com/v1";
+      }),
+    });
+    await renderApp(t);
+    openTab(t, "settings");
+
+    expect(presetSelect(settingsSection(t("meetingNotesProvider"))).value).toBe("deepseek");
+    expect(presetSelect(settingsSection(t("translation"))).value).toBe("custom");
+    expect(within(settingsSection(t("translation"))).getByRole("option", { name: t("providerCustom") })).toBeTruthy();
+    expect(labelled(settingsSection(t("meetingNotesProvider")), t("meetingNotesEndpoint")).readOnly).toBe(true);
+    expect(labelled(settingsSection(t("translation")), t("translationEndpoint")).readOnly).toBe(false);
+  });
+
+  it("fills the endpoint and model from a preset and locks the endpoint", async () => {
+    scriptAppDefaults({
+      settings: appSettings((next) => {
+        next.meetingNotes.endpoint = "https://internal.example.com/v1";
+        next.meetingNotes.model = "internal-model";
+      }),
+    });
+    await renderApp(t);
+    openTab(t, "settings");
+    expect(labelled(settingsSection(t("meetingNotesProvider")), t("meetingNotesEndpoint")).readOnly).toBe(false);
+
+    fireEvent.change(presetSelect(settingsSection(t("meetingNotesProvider"))), { target: { value: "deepseek" } });
+
+    const section = settingsSection(t("meetingNotesProvider"));
+    expect(labelled(section, t("meetingNotesEndpoint")).value).toBe("https://api.deepseek.com/v1");
+    expect(labelled(section, t("meetingNotesEndpoint")).readOnly).toBe(true);
+    expect(labelled(section, t("meetingNotesModel")).value).toBe("deepseek-chat");
+    expect(suggestions("meetingNotes")).toEqual(["deepseek-chat", "deepseek-reasoner"]);
+  });
+
+  it("clears the model for a preset that ships none and unlocks the endpoint on custom", async () => {
+    scriptAppDefaults({ settings: appSettings((next) => { next.meetingNotes.endpoint = "https://api.deepseek.com/v1"; next.meetingNotes.model = "deepseek-chat"; }) });
+    await renderApp(t);
+    openTab(t, "settings");
+
+    fireEvent.change(presetSelect(settingsSection(t("meetingNotesProvider"))), { target: { value: "omlx" } });
+    expect(labelled(settingsSection(t("meetingNotesProvider")), t("meetingNotesEndpoint")).value).toBe("http://127.0.0.1:8000/v1");
+    expect(labelled(settingsSection(t("meetingNotesProvider")), t("meetingNotesModel")).value).toBe("");
+    expect(suggestions("meetingNotes")).toEqual([]);
+
+    fireEvent.change(presetSelect(settingsSection(t("meetingNotesProvider"))), { target: { value: "custom" } });
+
+    const section = settingsSection(t("meetingNotesProvider"));
+    expect(presetSelect(section).value).toBe("custom");
+    expect(labelled(section, t("meetingNotesEndpoint")).readOnly).toBe(false);
+    expect(labelled(section, t("meetingNotesEndpoint")).value).toBe("http://127.0.0.1:8000/v1");
+    typeInto(labelled(section, t("meetingNotesEndpoint")), "https://internal.example.com/v1");
+    expect(labelled(settingsSection(t("meetingNotesProvider")), t("meetingNotesEndpoint")).value).toBe("https://internal.example.com/v1");
+  });
+});
+
+describe("model discovery", () => {
+  it("merges the fetched ids into the suggestions without saving anything", async () => {
+    scriptAppDefaults({ settings: appSettings((next) => { next.meetingNotes.endpoint = "https://api.deepseek.com/v1"; next.meetingNotes.model = "deepseek-chat"; }) });
+    script("list_provider_models", () => ["deepseek-vl", "deepseek-reasoner"]);
+    await renderApp(t);
+    openTab(t, "settings");
+    typeInto(apiKeyInput(settingsSection(t("meetingNotesProvider"))), "notes-secret");
+
+    fireEvent.click(fetchButton(settingsSection(t("meetingNotesProvider"))));
+    expect(fetchButton(settingsSection(t("translation"))).disabled).toBe(true);
+    expect(within(settingsSection(t("meetingNotesProvider"))).getByText(t("fetchingModels"))).toBeTruthy();
+
+    await waitFor(() => expect(callsOf("list_provider_models")).toHaveLength(1));
+    const request = fetchedPayload();
+    expect(request.provider).toBe("meetingNotes");
+    expect(request.settings.meetingNotes.endpoint).toBe("https://api.deepseek.com/v1");
+    expect(request.secrets.meetingNotesApiKey).toEqual({ action: "set", value: "notes-secret" });
+    expect(JSON.stringify(request.settings)).not.toContain("apiKeyConfigured");
+    await waitFor(() => expect(suggestions("meetingNotes")).toEqual(["deepseek-chat", "deepseek-reasoner", "deepseek-vl"]));
+    expect(suggestions("translation")).toEqual([]);
+    expect(callsOf("save_settings")).toHaveLength(0);
+  });
+
+  it("reports a failed fetch in the user's language and keeps the form untouched", async () => {
+    scriptAppDefaults();
+    await renderApp(t);
+    openTab(t, "settings");
+    scriptFailure("list_provider_models", errorPayload({ code: "PROVIDER_UNAVAILABLE", messageKey: "meetingNotesErrorProviderUnavailable", retryable: true }));
+    typeInto(labelled(settingsSection(t("meetingNotesProvider")), t("meetingNotesModel")), "gpt-5-mini");
+
+    fireEvent.click(fetchButton(settingsSection(t("meetingNotesProvider"))));
+
+    await screen.findByText(t("meetingNotesErrorProviderUnavailable"));
+    const section = settingsSection(t("meetingNotesProvider"));
+    expect(labelled(section, t("meetingNotesModel")).value).toBe("gpt-5-mini");
+    expect(apiKeyInput(section).value).toBe("");
+    expect(fetchButton(section).disabled).toBe(false);
+    expect(callsOf("save_settings")).toHaveLength(0);
+  });
+
+  it("cannot fetch while a connection test is in flight or a key would travel in the clear", async () => {
+    scriptAppDefaults({ settings: appSettings((next) => { next.translation.apiKeyConfigured = true; next.translation.endpoint = "http://notes.example.com/v1"; }) });
+    await renderApp(t);
+    openTab(t, "settings");
+    expect(fetchButton(settingsSection(t("translation"))).disabled).toBe(true);
+    expect(fetchButton(settingsSection(t("meetingNotesProvider"))).disabled).toBe(false);
+
+    fireEvent.click(testButton(settingsSection(t("meetingNotesProvider"))));
+
+    expect(fetchButton(settingsSection(t("meetingNotesProvider"))).disabled).toBe(true);
+    expect(callsOf("list_provider_models")).toHaveLength(0);
+    await waitFor(() => expect(callsOf("test_provider_settings")).toHaveLength(1));
   });
 });
 

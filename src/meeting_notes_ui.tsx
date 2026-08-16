@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { format, type TranslationKey, type translator } from "./i18n";
-import { Icon, isTauri, NumberField, SettingsSection, TextField, formatClock, formatDuration } from "./ui";
+import { Icon, isTauri, NumberField, SelectField, SettingsSection, TextField, formatClock, formatDuration } from "./ui";
 import {
   EMPTY_MEETING_CONTEXT,
   type ActionItem,
@@ -42,6 +42,44 @@ export interface ProviderTestProps {
   passed: ProviderKind | null;
   running: ProviderKind | null;
   test: (provider: ProviderKind) => void;
+}
+
+/** A known endpoint and the models it is expected to serve. */
+export interface ProviderPreset {
+  defaultModel: string;
+  endpoint: string;
+  id: string;
+  label: string;
+  models: string[];
+}
+
+/** The fetched half of the model combobox: never persisted, so a stale list
+ *  cannot outlive the session that fetched it. */
+export interface ProviderFetchProps {
+  errors: Record<ProviderKind, string | null>;
+  fetch: (provider: ProviderKind) => void;
+  models: Record<ProviderKind, string[]>;
+  running: ProviderKind | null;
+}
+
+/** oMLX serves whatever the local machine has loaded, so it ships no static
+ *  list and relies on the fetch button. */
+export const PROVIDER_PRESETS: ProviderPreset[] = [
+  { defaultModel: "", endpoint: "http://127.0.0.1:8000/v1", id: "omlx", label: "oMLX", models: [] },
+  { defaultModel: "deepseek-chat", endpoint: "https://api.deepseek.com/v1", id: "deepseek", label: "DeepSeek", models: ["deepseek-chat", "deepseek-reasoner"] },
+];
+
+export const CUSTOM_PRESET_ID = "custom";
+
+function normalizeEndpoint(endpoint: string) { return endpoint.trim().replace(/\/+$/, ""); }
+
+export function matchPreset(endpoint: string): ProviderPreset | null {
+  const normalized = normalizeEndpoint(endpoint);
+  return PROVIDER_PRESETS.find((preset) => normalizeEndpoint(preset.endpoint) === normalized) ?? null;
+}
+
+export function modelOptions(endpoint: string, fetched: string[]) {
+  return [...new Set([...(matchPreset(endpoint)?.models ?? []), ...fetched])].sort();
 }
 
 /** Ordering metadata shared by the status event and the read view. */
@@ -249,6 +287,40 @@ export function ApiKeyField({ configured, disabled = false, onChange, secret, t 
   </div>;
 }
 
+/** The endpoint stays the source of truth — nothing new is persisted. Picking a
+ *  preset rewrites the endpoint and the model together and locks the endpoint;
+ *  picking Custom only unlocks it, leaving the current values alone. */
+export function ProviderEndpointFields({ disabled = false, endpoint, endpointLabel, onEndpoint, onSelect, t }: { disabled?: boolean; endpoint: string; endpointLabel: string; onEndpoint: (endpoint: string) => void; onSelect: (preset: ProviderPreset) => void; t: Translate }) {
+  const [custom, setCustom] = useState(false);
+  const preset = custom ? null : matchPreset(endpoint);
+  return <>
+    <SelectField
+      disabled={disabled}
+      label={t("providerPreset")}
+      options={[...PROVIDER_PRESETS.map((item) => ({ label: item.label, value: item.id })), { label: t("providerCustom"), value: CUSTOM_PRESET_ID }]}
+      value={preset?.id ?? CUSTOM_PRESET_ID}
+      onChange={(value) => { const chosen = PROVIDER_PRESETS.find((item) => item.id === value); setCustom(chosen === undefined); if (chosen) onSelect(chosen); }}
+    />
+    <TextField disabled={disabled} label={endpointLabel} readonly={preset !== null} type="url" value={endpoint} onChange={onEndpoint} />
+  </>;
+}
+
+export function ProviderModelField({ className = "", disabled = false, endpoint, fetch, fetchBlocked, label, onChange, provider, t, value }: { className?: string; disabled?: boolean; endpoint: string; fetch: ProviderFetchProps; fetchBlocked: boolean; label: string; onChange: (value: string) => void; provider: ProviderKind; t: Translate; value: string }) {
+  const listId = `provider-models-${provider}`;
+  const fetching = fetch.running === provider;
+  const error = fetch.errors[provider];
+  const options = modelOptions(endpoint, fetch.models[provider]);
+  return <div class={`field model-field ${className}`}>
+    <span>{label}</span>
+    <div class="model-row">
+      <input aria-label={label} autocomplete="off" disabled={disabled} list={listId} spellcheck={false} value={value} onInput={(event) => onChange(event.currentTarget.value)} />
+      <button aria-label={t("fetchModels")} class="icon-button model-refresh" disabled={disabled || fetchBlocked || fetch.running !== null} title={t("fetchModels")} type="button" onClick={() => fetch.fetch(provider)}><Icon name="refresh" /></button>
+    </div>
+    <datalist id={listId}>{options.map((option) => <option key={option} value={option} />)}</datalist>
+    {(fetching || error !== null) && <p class={`model-note ${error !== null && !fetching ? "failed" : ""}`} role={error !== null && !fetching ? "alert" : undefined}>{fetching ? t("fetchingModels") : error}</p>}
+  </div>;
+}
+
 export function EndpointWarning({ blocked, endpoint, t }: { blocked: boolean; endpoint: string; t: Translate }) {
   if (!isPlainRemoteEndpoint(endpoint)) return null;
   return <p class={`inline-warning ${blocked ? "blocking" : ""}`} role={blocked ? "alert" : undefined}>{t("insecureEndpointWarning")}{blocked ? ` ${t("insecureEndpointBlocked")}` : ""}</p>;
@@ -274,12 +346,12 @@ export function ProviderStatusRow({ disabled, error, passed, state, t, test }: {
   </div>;
 }
 
-export function MeetingNotesProviderSection({ blocked, onSecret, secret, settings, status, t, update }: { blocked: boolean; onSecret: (secret: SecretUpdate) => void; secret: SecretUpdate; settings: AppSettings; status: ComponentChildren; t: Translate; update: (mutate: (next: AppSettings) => void) => void }) {
+export function MeetingNotesProviderSection({ blocked, fetch, fetchBlocked, onSecret, secret, settings, status, t, update }: { blocked: boolean; fetch: ProviderFetchProps; fetchBlocked: boolean; onSecret: (secret: SecretUpdate) => void; secret: SecretUpdate; settings: AppSettings; status: ComponentChildren; t: Translate; update: (mutate: (next: AppSettings) => void) => void }) {
   return <SettingsSection icon="chat" title={t("meetingNotesProvider")}>
     <p class="section-note">{t("meetingNotesProviderHint")}</p>
     <div class="form-grid">
-      <TextField label={t("meetingNotesModel")} value={settings.meetingNotes.model} onChange={(value) => update((next) => { next.meetingNotes.model = value; })} />
-      <TextField label={t("meetingNotesEndpoint")} type="url" value={settings.meetingNotes.endpoint} onChange={(value) => update((next) => { next.meetingNotes.endpoint = value; })} />
+      <ProviderEndpointFields endpoint={settings.meetingNotes.endpoint} endpointLabel={t("meetingNotesEndpoint")} t={t} onEndpoint={(value) => update((next) => { next.meetingNotes.endpoint = value; })} onSelect={(preset) => update((next) => { next.meetingNotes.endpoint = preset.endpoint; next.meetingNotes.model = preset.defaultModel; })} />
+      <ProviderModelField endpoint={settings.meetingNotes.endpoint} fetch={fetch} fetchBlocked={fetchBlocked} label={t("meetingNotesModel")} provider="meetingNotes" t={t} value={settings.meetingNotes.model} onChange={(value) => update((next) => { next.meetingNotes.model = value; })} />
       <ApiKeyField configured={settings.meetingNotes.apiKeyConfigured} secret={secret} t={t} onChange={onSecret} />
     </div>
     <EndpointWarning blocked={blocked} endpoint={settings.meetingNotes.endpoint} t={t} />

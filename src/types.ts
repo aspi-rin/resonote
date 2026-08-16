@@ -65,6 +65,7 @@ export interface AppSettingsWithoutSecrets extends Omit<AppSettings, "meetingNot
   translation: Omit<AppSettings["translation"], "apiKeyConfigured" | "verified">;
 }
 
+/** Shared by `test_provider_settings` and `list_provider_models`. */
 export interface TestProviderSettingsRequest {
   provider: ProviderKind;
   secrets: SettingsSecretUpdates;

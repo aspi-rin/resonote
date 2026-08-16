@@ -4,7 +4,10 @@ use serde::Deserialize;
 
 use crate::{
     meeting_notes_document::{MeetingNotesError, MeetingNotesErrorCode, chat_error_code},
-    openai_compatible::{ChatCompletionPort, ChatMessage, ChatRequest, ChatRole},
+    openai_compatible::{
+        ChatCompletionPort, ChatError, ChatMessage, ChatRequest, ChatRole, ModelListPort,
+        ModelListRequest,
+    },
     settings::{
         AppSettings, AppSettingsView, AppSettingsWithoutSecrets, ProviderKind, SecretString,
         SettingsError, SettingsSecretUpdates, SettingsStore,
@@ -23,11 +26,15 @@ pub struct TestProviderRequest {
     pub settings: AppSettingsWithoutSecrets,
 }
 
-/// Never borrows the request: the probe runs against the merged configuration,
+/// Never borrows the request: both calls run against the merged configuration,
 /// so the settings that were verified are exactly the settings that get saved.
-struct ProviderProbe {
+struct ProviderCredentials {
     api_key: Option<SecretString>,
     endpoint: String,
+}
+
+struct ProviderProbe {
+    credentials: ProviderCredentials,
     model: String,
     timeout: Duration,
 }
@@ -43,8 +50,8 @@ pub fn test_provider(
         .map_err(settings_error)?;
     let probe = probe_for(&merged, provider)?;
     chat.complete(ChatRequest {
-        api_key: probe.api_key.as_ref(),
-        endpoint: &probe.endpoint,
+        api_key: probe.credentials.api_key.as_ref(),
+        endpoint: &probe.credentials.endpoint,
         messages: vec![ChatMessage {
             content: PROBE_MESSAGE,
             role: ChatRole::User,
@@ -52,16 +59,37 @@ pub fn test_provider(
         model: &probe.model,
         timeout: probe.timeout,
     })
-    .map_err(|error| MeetingNotesError::new(chat_error_code(&error)).with_source(error))?;
+    .map_err(chat_failure)?;
     store
         .save_verified(merged, provider)
         .map_err(settings_error)
+}
+
+/// Discovery, not verification: nothing is persisted and no model is required,
+/// because the list is exactly what a user without a model needs.
+pub fn list_provider_models(
+    store: &SettingsStore,
+    lister: &dyn ModelListPort,
+    request: TestProviderRequest,
+) -> Result<Vec<String>, MeetingNotesError> {
+    let provider = request.provider;
+    let merged = store
+        .merge_for_test(request.settings, request.secrets)
+        .map_err(settings_error)?;
+    let credentials = credentials_for(&merged, provider);
+    lister
+        .list_models(ModelListRequest {
+            api_key: credentials.api_key.as_ref(),
+            endpoint: &credentials.endpoint,
+        })
+        .map_err(chat_failure)
 }
 
 fn probe_for(
     settings: &AppSettings,
     provider: ProviderKind,
 ) -> Result<ProviderProbe, MeetingNotesError> {
+    let credentials = credentials_for(settings, provider);
     match provider {
         ProviderKind::MeetingNotes => {
             let notes = &settings.meeting_notes;
@@ -71,19 +99,34 @@ fn probe_for(
                 ));
             }
             Ok(ProviderProbe {
-                api_key: notes.bound_key().cloned(),
-                endpoint: notes.endpoint.clone(),
+                credentials,
                 model: notes.model.trim().to_owned(),
                 timeout: Duration::from_secs(u64::from(notes.request_timeout_seconds)),
             })
         }
         ProviderKind::Translation => Ok(ProviderProbe {
-            api_key: settings.translation.bound_key().cloned(),
-            endpoint: settings.translation.endpoint.clone(),
+            credentials,
             model: settings.translation.model.trim().to_owned(),
             timeout: TRANSLATION_TIMEOUT,
         }),
     }
+}
+
+fn credentials_for(settings: &AppSettings, provider: ProviderKind) -> ProviderCredentials {
+    match provider {
+        ProviderKind::MeetingNotes => ProviderCredentials {
+            api_key: settings.meeting_notes.bound_key().cloned(),
+            endpoint: settings.meeting_notes.endpoint.clone(),
+        },
+        ProviderKind::Translation => ProviderCredentials {
+            api_key: settings.translation.bound_key().cloned(),
+            endpoint: settings.translation.endpoint.clone(),
+        },
+    }
+}
+
+fn chat_failure(error: ChatError) -> MeetingNotesError {
+    MeetingNotesError::new(chat_error_code(&error)).with_source(error)
 }
 
 fn settings_error(error: SettingsError) -> MeetingNotesError {

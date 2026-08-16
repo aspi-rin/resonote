@@ -132,6 +132,23 @@ async fn test_provider_settings(
     .map_err(report_meeting_notes_error)
 }
 
+/// Reads `{endpoint}/models` against the submitted configuration without
+/// persisting anything, so a user can pick a model before one is set.
+#[tauri::command]
+async fn list_provider_models(
+    app: tauri::AppHandle,
+    request: TestProviderRequest,
+) -> Result<Vec<String>, MeetingNotesErrorPayload> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let lister =
+            ReqwestChatClient::new().map_err(|error| MeetingNotesError::io().with_source(error))?;
+        provider_check::list_provider_models(&app.state::<SettingsStore>(), &lister, request)
+    })
+    .await
+    .map_err(|error| report_meeting_notes_error(MeetingNotesError::io().with_source(error)))?
+    .map_err(report_meeting_notes_error)
+}
+
 #[tauri::command]
 fn get_global_context(state: tauri::State<'_, Arc<GlobalContextStore>>) -> GlobalContextDocument {
     state.document()
@@ -543,6 +560,7 @@ pub fn run() {
             get_session_translation,
             get_transcription_status,
             install_model,
+            list_provider_models,
             list_recording_history,
             list_transcription_models,
             open_recording_directory,

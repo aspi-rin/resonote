@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::{
     openai_compatible::{
         ChatError, ReqwestChatClient,
-        test_support::{ScriptedChatClient, json_response, serve_once},
+        test_support::{ScriptedChatClient, ScriptedModelLister, json_response, serve_once},
     },
     settings::SecretUpdate,
 };
@@ -178,6 +178,124 @@ fn reports_a_key_bound_to_a_plaintext_remote_endpoint_as_insecure() {
 
     assert_eq!(error.code(), MeetingNotesErrorCode::InsecureEndpoint);
     assert!(chat.requests().is_empty());
+}
+
+#[test]
+fn lists_models_for_a_meeting_notes_provider_that_has_no_model_yet() {
+    let (_directory, store) = store();
+    let lister = ScriptedModelLister::new(vec![Ok(vec![
+        "deepseek-chat".to_owned(),
+        "deepseek-reasoner".to_owned(),
+    ])]);
+    let mut settings = AppSettings::default();
+    settings.meeting_notes.endpoint = "https://api.example.com/v1".to_owned();
+
+    let models = list_provider_models(
+        &store,
+        &lister,
+        request(
+            &settings,
+            ProviderKind::MeetingNotes,
+            SettingsSecretUpdates::default(),
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(models, vec!["deepseek-chat", "deepseek-reasoner"]);
+    assert_eq!(lister.requests().len(), 1);
+    assert_eq!(lister.requests()[0].endpoint, "https://api.example.com/v1");
+    assert!(lister.requests()[0].api_key.is_none());
+}
+
+#[test]
+fn refuses_to_list_models_with_a_key_bound_to_a_plaintext_remote_endpoint() {
+    let (_directory, store) = store();
+    let lister = ScriptedModelLister::new(vec![Ok(Vec::new())]);
+    let mut settings = AppSettings::default();
+    settings.translation.endpoint = "http://provider.example/v1".to_owned();
+
+    let error = list_provider_models(
+        &store,
+        &lister,
+        request(
+            &settings,
+            ProviderKind::Translation,
+            SettingsSecretUpdates {
+                translation_api_key: SecretUpdate::Set {
+                    value: "secret".to_owned(),
+                },
+                ..SettingsSecretUpdates::default()
+            },
+        ),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code(), MeetingNotesErrorCode::InsecureEndpoint);
+    assert_eq!(error.payload().code.as_str(), "INSECURE_ENDPOINT");
+    assert!(lister.requests().is_empty());
+}
+
+#[test]
+fn never_persists_anything_while_listing_models() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("settings.json");
+    let store = SettingsStore::open(path.clone()).unwrap();
+    let lister = ScriptedModelLister::new(vec![Ok(vec!["alpha".to_owned()])]);
+    let mut settings = AppSettings::default();
+    settings.translation.endpoint = "https://api.example.com/v1".to_owned();
+    settings.translation.model = "never-stored-model".to_owned();
+
+    list_provider_models(
+        &store,
+        &lister,
+        request(
+            &settings,
+            ProviderKind::Translation,
+            SettingsSecretUpdates {
+                translation_api_key: SecretUpdate::Set {
+                    value: "never-stored-key".to_owned(),
+                },
+                ..SettingsSecretUpdates::default()
+            },
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        lister.requests()[0].api_key.as_deref(),
+        Some("never-stored-key")
+    );
+    let reopened = SettingsStore::open(path).unwrap();
+    assert_eq!(reopened.snapshot().translation.model, "Hy-MT2-1.8B");
+    assert_eq!(
+        reopened.snapshot().translation.endpoint,
+        "http://127.0.0.1:8000/v1"
+    );
+    assert!(!reopened.view().translation.provider.api_key_configured);
+    assert_eq!(store.snapshot().translation.model, "Hy-MT2-1.8B");
+}
+
+#[test]
+fn surfaces_a_listing_failure_as_the_same_structured_payload_as_a_test() {
+    let (_directory, store) = store();
+    let lister = ScriptedModelLister::new(vec![Err(ChatError::Unauthorized)]);
+
+    let error = list_provider_models(
+        &store,
+        &lister,
+        request(
+            &AppSettings::default(),
+            ProviderKind::MeetingNotes,
+            SettingsSecretUpdates::default(),
+        ),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code(), MeetingNotesErrorCode::ProviderUnauthorized);
+    assert_eq!(
+        error.payload().message_key,
+        "meetingNotesErrorProviderUnauthorized"
+    );
 }
 
 #[test]

@@ -13,9 +13,16 @@ use crate::settings::SecretString;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub trait ChatCompletionPort: Send + Sync {
     fn complete(&self, request: ChatRequest<'_>) -> Result<String, ChatError>;
+}
+
+/// Discovery, deliberately split from completion: listing needs no model, so it
+/// stays usable before one has ever been picked.
+pub trait ModelListPort: Send + Sync {
+    fn list_models(&self, request: ModelListRequest<'_>) -> Result<Vec<String>, ChatError>;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,6 +52,12 @@ pub struct ChatRequest<'a> {
     pub messages: Vec<ChatMessage<'a>>,
     pub model: &'a str,
     pub timeout: Duration,
+}
+
+/// Never derives Serialize or Debug: it borrows a secret.
+pub struct ModelListRequest<'a> {
+    pub api_key: Option<&'a SecretString>,
+    pub endpoint: &'a str,
 }
 
 pub struct ReqwestChatClient {
@@ -97,6 +110,34 @@ impl ChatCompletionPort for ReqwestChatClient {
     }
 }
 
+impl ModelListPort for ReqwestChatClient {
+    fn list_models(&self, request: ModelListRequest<'_>) -> Result<Vec<String>, ChatError> {
+        let url = models_url(request.endpoint)?;
+        let api_key = request
+            .api_key
+            .map(SecretString::trimmed)
+            .filter(|key| !key.is_empty());
+        if api_key.is_some() && !allows_bearer_auth(&url) {
+            return Err(ChatError::InsecureEndpoint);
+        }
+        let mut builder = self.client.get(url).timeout(MODELS_TIMEOUT);
+        if let Some(api_key) = api_key {
+            builder = builder.header(AUTHORIZATION, format!("Bearer {api_key}"));
+        }
+        let response = builder.send().map_err(classify_transport_error)?;
+        let status = response.status();
+        if status.is_redirection() {
+            return Err(ChatError::InvalidEndpoint {
+                status: Some(status),
+            });
+        }
+        if !status.is_success() {
+            return Err(classify_status(status));
+        }
+        parse_model_ids(&read_body(response)?)
+    }
+}
+
 pub fn chat_completions_url(endpoint: &str) -> Result<Url, ChatError> {
     let mut url =
         Url::parse(endpoint.trim()).map_err(|_| ChatError::InvalidEndpoint { status: None })?;
@@ -118,6 +159,19 @@ pub fn chat_completions_url(endpoint: &str) -> Result<Url, ChatError> {
     url.set_path(&path);
     url.set_query(None);
     url.set_fragment(None);
+    Ok(url)
+}
+
+/// Derived from the completions URL so both calls agree on what an endpoint
+/// means, then swapped onto the sibling `/models` path.
+pub fn models_url(endpoint: &str) -> Result<Url, ChatError> {
+    let mut url = chat_completions_url(endpoint)?;
+    let base = url
+        .path()
+        .strip_suffix("/chat/completions")
+        .unwrap_or_default()
+        .to_owned();
+    url.set_path(&format!("{base}/models"));
     Ok(url)
 }
 
@@ -190,6 +244,30 @@ fn parse_completion(body: &str) -> Result<String, ChatError> {
         .map(|content| content.trim().to_owned())
         .filter(|content| !content.is_empty())
         .ok_or(ChatError::ProviderResponseInvalid)
+}
+
+fn parse_model_ids(body: &str) -> Result<Vec<String>, ChatError> {
+    #[derive(Deserialize)]
+    struct ModelsResponse {
+        data: Vec<ModelEntry>,
+    }
+    #[derive(Deserialize)]
+    struct ModelEntry {
+        id: Option<String>,
+    }
+
+    let parsed: ModelsResponse =
+        serde_json::from_str(body).map_err(|_| ChatError::ProviderResponseInvalid)?;
+    let mut ids = parsed
+        .data
+        .into_iter()
+        .filter_map(|entry| entry.id)
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
 }
 
 fn classify_transport_error(error: reqwest::Error) -> ChatError {
@@ -279,7 +357,7 @@ pub mod test_support {
         time::Duration,
     };
 
-    use super::{ChatCompletionPort, ChatError, ChatRequest};
+    use super::{ChatCompletionPort, ChatError, ChatRequest, ModelListPort, ModelListRequest};
 
     /// Answers exactly one chat request and hands the raw request text back, so
     /// a test can assert on the headers the client actually sent.
@@ -392,6 +470,54 @@ pub mod test_support {
                         .collect(),
                     model: request.model.to_owned(),
                     timeout: request.timeout,
+                });
+            self.results
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .unwrap_or(Err(ChatError::ProviderResponseInvalid))
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct RecordedModelsRequest {
+        pub api_key: Option<String>,
+        pub endpoint: String,
+    }
+
+    /// The listing counterpart of `ScriptedChatClient`.
+    pub struct ScriptedModelLister {
+        requests: Mutex<Vec<RecordedModelsRequest>>,
+        results: Mutex<VecDeque<Result<Vec<String>, ChatError>>>,
+    }
+
+    impl ScriptedModelLister {
+        pub fn new(results: Vec<Result<Vec<String>, ChatError>>) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                results: Mutex::new(results.into()),
+            }
+        }
+
+        pub fn requests(&self) -> Vec<RecordedModelsRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl ModelListPort for ScriptedModelLister {
+        fn list_models(&self, request: ModelListRequest<'_>) -> Result<Vec<String>, ChatError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(RecordedModelsRequest {
+                    api_key: request
+                        .api_key
+                        .map(|key| key.trimmed().to_owned())
+                        .filter(|key| !key.is_empty()),
+                    endpoint: request.endpoint.to_owned(),
                 });
             self.results
                 .lock()
