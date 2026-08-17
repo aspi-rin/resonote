@@ -1,12 +1,12 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/preact";
 import { describe, expect, it, vi } from "vitest";
 import { translator } from "../i18n";
-import { MeetingNotesChips, MeetingNotesDetail, SummaryPanel } from "../meeting_notes_ui";
+import { hasSpokenContent, MeetingNotesChips, MeetingNotesDetail, SummaryPanel } from "../meeting_notes_ui";
 import { clipboardWrite, confirmDialog, scrollIntoView } from "../test/dom";
-import { analysisResult, completeAnalysisView, errorPayload, globalContent, meetingContent, runView, transcriptDocument } from "../test/fixtures";
+import { CLEANED_SEGMENTS, analysisResult, completeAnalysisView, errorPayload, globalContent, meetingContent, runView, transcriptDocument, transcriptSegment } from "../test/fixtures";
 import { detailProps, selectDetailTab, type DetailProps } from "../test/render";
 import { script } from "../test/tauri";
-import type { RunError } from "../types";
+import type { RunError, TranscriptDocument } from "../types";
 
 const t = translator("en-US");
 
@@ -14,8 +14,8 @@ function runError(overrides: Partial<RunError> = {}): RunError {
   return { causeCode: null, code: "PROVIDER_TIMEOUT", httpStatus: null, messageKey: "meetingNotesErrorProviderTimeout", retryable: true, stage: "cleaning", ...overrides };
 }
 
-function renderDetail(overrides: Partial<DetailProps> = {}) {
-  script("get_session_transcript", () => transcriptDocument());
+function renderDetail(overrides: Partial<DetailProps> = {}, transcript: TranscriptDocument = transcriptDocument()) {
+  script("get_session_transcript", () => transcript);
   const props = detailProps({ analysis: completeAnalysisView(), globalContext: globalContent({ knowledgeBackground: "当前全局背景" }), ...overrides });
   return { ...render(<MeetingNotesDetail {...props} />), props };
 }
@@ -136,6 +136,39 @@ describe("source timestamps", () => {
   });
 });
 
+describe("raw transcript visibility", () => {
+  it("hides a contentless complete segment while keeping normal, processing and failed rows", async () => {
+    renderDetail({}, transcriptDocument([
+      transcriptSegment({ id: 1, text: "我们确认下季度优先级。" }),
+      transcriptSegment({ id: 2, text: "..." }),
+      transcriptSegment({ id: 3, status: "processing", text: "" }),
+      transcriptSegment({ id: 4, status: "failed", text: "" }),
+    ]));
+    selectDetailTab(t, "tabTranscript");
+
+    expect(await screen.findByText("我们确认下季度优先级。")).toBeTruthy();
+    expect(document.querySelectorAll(".transcript-row")).toHaveLength(3);
+    expect(screen.getByText(`${t("transcribing")}…`)).toBeTruthy();
+    expect(screen.getByText(t("transcriptFailed"))).toBeTruthy();
+    expect(screen.queryByText("...")).toBeNull();
+  });
+});
+
+describe("hasSpokenContent", () => {
+  it("treats empty or punctuation-only text as contentless", () => {
+    expect(hasSpokenContent("...")).toBe(false);
+    expect(hasSpokenContent("。。。")).toBe(false);
+    expect(hasSpokenContent("")).toBe(false);
+    expect(hasSpokenContent(" . , ! ")).toBe(false);
+  });
+
+  it("treats any letter or digit as content", () => {
+    expect(hasSpokenContent("こんにちは")).toBe(true);
+    expect(hasSpokenContent("OK.")).toBe(true);
+    expect(hasSpokenContent("3")).toBe(true);
+  });
+});
+
 describe("current and snapshot context", () => {
   it("separates the editable meeting context from the frozen snapshot", () => {
     renderDetail();
@@ -165,6 +198,14 @@ describe("current and snapshot context", () => {
 describe("copy actions", () => {
   it("copies the cleaned transcript with timestamps", () => {
     renderDetail();
+    selectDetailTab(t, "tabCleaned");
+
+    fireEvent.click(screen.getByRole("button", { name: t("copyText") }));
+    expect(clipboardWrite).toHaveBeenCalledWith("[00:05] 我们确认下季度优先级。\n[01:05] 预算保持不变。");
+  });
+
+  it("skips contentless segments when copying the cleaned transcript", () => {
+    renderDetail({ analysis: completeAnalysisView({ lastSuccessfulResult: analysisResult({ cleaned: { segments: [...CLEANED_SEGMENTS, { endMs: 75_000, segmentId: 3, startMs: 71_000, text: "..." }] } }) }) });
     selectDetailTab(t, "tabCleaned");
 
     fireEvent.click(screen.getByRole("button", { name: t("copyText") }));

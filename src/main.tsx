@@ -33,6 +33,7 @@ import {
   analysisStatusFromView,
   apiKeySecret,
   describeError,
+  hasSpokenContent,
   isNewerAnalysisStatus,
   parseMeetingNotesError,
   providerDirty,
@@ -901,7 +902,7 @@ function LiveTranscriptPanel({ t, segments, translations, settings, transcriptio
     <div class="transcript-scroll" style={{ height: `${height}px` }} ref={scrollRef} onScroll={trackScroll} aria-live="polite" aria-relevant="additions text">
       {segments.length === 0
         ? <p class="transcript-empty">{t("liveTranscriptEmpty")}</p>
-        : <ol class="transcript-list">{segments.map((segment) => { const translation = translations.find((item) => item.segmentId === segment.id); return <li class={`transcript-row ${segment.status}`} key={segment.id}><time>{formatDuration(segment.startMs)}</time><div class="transcript-copy"><span class="transcript-source">{segmentText(t, segment)}</span>{translation && <span class={`transcript-translation ${translation.status}`}>{translationText(t, translation)}</span>}</div></li>; })}</ol>}
+        : <ol class="transcript-list">{segments.filter((segment) => segment.status !== "complete" || hasSpokenContent(segment.text)).map((segment) => { const translation = translations.find((item) => item.segmentId === segment.id); return <li class={`transcript-row ${segment.status}`} key={segment.id}><time>{formatDuration(segment.startMs)}</time><div class="transcript-copy"><span class="transcript-source">{segmentText(t, segment)}</span>{translation && <span class={`transcript-translation ${translation.status}`}>{translationText(t, translation)}</span>}</div></li>; })}</ol>}
     </div>
     <div class="transcript-resize" role="separator" aria-orientation="horizontal" aria-label={t("resizeTranscript")} aria-valuemin={TRANSCRIPT_MIN_HEIGHT} aria-valuemax={TRANSCRIPT_MAX_HEIGHT} aria-valuenow={height} tabIndex={0} onPointerDown={beginResize} onKeyDown={nudgeResize} />
   </section>;
@@ -1003,7 +1004,7 @@ function Level({ label, value, muted }: { label: string; value: number; muted: b
 
 function sourceLabel(t: ReturnType<typeof translator>, source: HistoryEntry["audioSource"]) { return t(source); }
 function segmentText(t: ReturnType<typeof translator>, segment: TranscriptSegment) {
-  if (segment.status === "complete") return segment.text.trim() || "…";
+  if (segment.status === "complete") return segment.text.trim();
   if (segment.status === "failed") return t("transcriptFailed");
   return `${t("transcribing")}…`;
 }

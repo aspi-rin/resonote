@@ -206,6 +206,14 @@ export function staleReasonKey(reason: StaleReason): TranslationKey {
   return keys[reason];
 }
 
+/** True when the text carries at least one letter or digit — false for empty
+ *  text and for the punctuation-only filler ("...", "。。。") some models emit for
+ *  contentless audio. Shared by the raw transcript view and the copy builder so
+ *  both hide the same rows a legacy session may have persisted literally. */
+export function hasSpokenContent(text: string): boolean {
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
 export function transcriptCounts(transcript: TranscriptDocument | null) {
   const segments = transcript?.segments ?? [];
   return {
@@ -227,7 +235,7 @@ export function needsPartialConfirmation(entry: HistoryEntry) {
 }
 
 export function cleanedPlainText(segments: CleanedSegment[]) {
-  return segments.map((segment) => `[${formatClock(segment.startMs)}] ${segment.text}`).join("\n");
+  return segments.filter((segment) => hasSpokenContent(segment.text)).map((segment) => `[${formatClock(segment.startMs)}] ${segment.text}`).join("\n");
 }
 
 export function summaryPlainText(t: Translate, summary: MeetingSummary) {
@@ -807,9 +815,9 @@ export function CleanedPanel({ copied, copy, highlight, segments, t }: { copied:
 
 function RawTranscriptPanel({ segments, t }: { segments: TranscriptSegment[]; t: Translate }) {
   if (segments.length === 0) return <p class="context-empty">{t("noTranscript")}</p>;
-  return <ol class="transcript-list">{segments.map((segment) => <li class={`transcript-row ${segment.status}`} key={segment.id}>
+  return <ol class="transcript-list">{segments.filter((segment) => segment.status !== "complete" || hasSpokenContent(segment.text)).map((segment) => <li class={`transcript-row ${segment.status}`} key={segment.id}>
     <time>{formatDuration(segment.startMs)}</time>
-    <div class="transcript-copy"><span class="transcript-source">{segment.status === "complete" ? segment.text.trim() || "…" : segment.status === "failed" ? t("transcriptFailed") : `${t("transcribing")}…`}</span></div>
+    <div class="transcript-copy"><span class="transcript-source">{segment.status === "complete" ? segment.text.trim() : segment.status === "failed" ? t("transcriptFailed") : `${t("transcribing")}…`}</span></div>
   </li>)}</ol>;
 }
 
