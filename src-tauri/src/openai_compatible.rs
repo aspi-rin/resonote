@@ -49,6 +49,9 @@ pub struct ChatMessage<'a> {
 pub struct ChatRequest<'a> {
     pub api_key: Option<&'a SecretString>,
     pub endpoint: &'a str,
+    /// `None` leaves the provider default in place; `Some` pins an explicit
+    /// output ceiling for callers whose prompts expect a long reply.
+    pub max_tokens: Option<u32>,
     pub messages: Vec<ChatMessage<'a>>,
     pub model: &'a str,
     pub timeout: Duration,
@@ -94,7 +97,11 @@ impl ChatCompletionPort for ReqwestChatClient {
             builder = builder.header(AUTHORIZATION, format!("Bearer {api_key}"));
         }
         let response = builder
-            .body(request_body(request.model, &request.messages))
+            .body(request_body(
+                request.model,
+                &request.messages,
+                request.max_tokens,
+            ))
             .send()
             .map_err(classify_transport_error)?;
         let status = response.status();
@@ -189,19 +196,22 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// The exact bytes sent to the provider, so callers can meter a request against
 /// their own character budget before building it.
-pub fn request_body(model: &str, messages: &[ChatMessage<'_>]) -> String {
+pub fn request_body(model: &str, messages: &[ChatMessage<'_>], max_tokens: Option<u32>) -> String {
     let messages = messages
         .iter()
         .map(|message| {
             serde_json::json!({ "role": message.role.as_str(), "content": message.content })
         })
         .collect::<Vec<_>>();
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "temperature": 0,
         "messages": messages,
-    })
-    .to_string()
+    });
+    if let (Some(max_tokens), Some(object)) = (max_tokens, body.as_object_mut()) {
+        object.insert("max_tokens".to_owned(), serde_json::json!(max_tokens));
+    }
+    body.to_string()
 }
 
 fn read_body(response: Response) -> Result<String, ChatError> {
@@ -226,6 +236,7 @@ fn parse_completion(body: &str) -> Result<String, ChatError> {
     }
     #[derive(Deserialize)]
     struct CompletionChoice {
+        finish_reason: Option<String>,
         message: Option<CompletionMessage>,
     }
     #[derive(Deserialize)]
@@ -235,11 +246,19 @@ fn parse_completion(body: &str) -> Result<String, ChatError> {
 
     let parsed: CompletionResponse =
         serde_json::from_str(body).map_err(|_| ChatError::ProviderResponseInvalid)?;
-    parsed
+    let choice = parsed
         .choices
         .into_iter()
         .next()
-        .and_then(|choice| choice.message)
+        .ok_or(ChatError::ProviderResponseInvalid)?;
+    // A completion cut off at the output limit is a distinct failure: the payload
+    // is well formed up to the cut, so reporting it as invalid output hides the
+    // real cause.
+    if choice.finish_reason.as_deref() == Some("length") {
+        return Err(ChatError::OutputTruncated);
+    }
+    choice
+        .message
         .and_then(|message| message.content)
         .map(|content| content.trim().to_owned())
         .filter(|content| !content.is_empty())
@@ -303,6 +322,8 @@ pub enum ChatError {
     InsecureEndpoint,
     #[error("chat endpoint is not a usable http or https chat completions URL")]
     InvalidEndpoint { status: Option<StatusCode> },
+    #[error("chat endpoint stopped the completion at its output token limit")]
+    OutputTruncated,
     #[error("chat endpoint returned an unusable completion payload")]
     ProviderResponseInvalid,
     #[error("chat endpoint rate limited the request (HTTP {0})")]
@@ -325,7 +346,8 @@ impl ChatError {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::ProviderResponseInvalid
+            Self::OutputTruncated
+                | Self::ProviderResponseInvalid
                 | Self::RateLimited(_)
                 | Self::RequestFailed
                 | Self::Timeout
@@ -423,6 +445,7 @@ pub mod test_support {
     pub struct RecordedChatRequest {
         pub api_key: Option<String>,
         pub endpoint: String,
+        pub max_tokens: Option<u32>,
         pub messages: Vec<(String, String)>,
         pub model: String,
         pub timeout: Duration,
@@ -461,6 +484,7 @@ pub mod test_support {
                         .map(|key| key.trimmed().to_owned())
                         .filter(|key| !key.is_empty()),
                     endpoint: request.endpoint.to_owned(),
+                    max_tokens: request.max_tokens,
                     messages: request
                         .messages
                         .iter()

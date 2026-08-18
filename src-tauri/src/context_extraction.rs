@@ -147,6 +147,7 @@ fn complete<T: DeserializeOwned>(
         .complete(ChatRequest {
             api_key: settings.bound_key(),
             endpoint: &settings.endpoint,
+            max_tokens: None,
             messages: chat_messages(system, user),
             model,
             timeout: Duration::from_secs(u64::from(settings.request_timeout_seconds)),

@@ -14,7 +14,7 @@ use crate::{
     meeting_notes_document::{
         CheckpointUnitState, InputQualityKind, MeetingContextContent, save_meeting_context,
     },
-    meeting_notes_pipeline::{CLEAN_SYSTEM_PROMPT, input_fingerprint},
+    meeting_notes_pipeline::{CLEAN_SYSTEM_PROMPT, MAX_OUTPUT_TOKENS, input_fingerprint},
     openai_compatible::{
         ChatError, ChatMessage, ChatRequest, ChatRole, ReqwestChatClient,
         test_support::RecordedChatRequest,
@@ -148,6 +148,7 @@ impl ChatCompletionPort for FakeProvider {
                     .map(|key| key.trimmed().to_owned())
                     .filter(|key| !key.is_empty()),
                 endpoint: request.endpoint.to_owned(),
+                max_tokens: request.max_tokens,
                 messages: request
                     .messages
                     .iter()
@@ -629,6 +630,11 @@ fn cleans_and_summarizes_a_session_end_to_end() {
     assert_eq!(requests[0].messages[0].1, CLEAN_SYSTEM_PROMPT);
     assert_eq!(requests[0].api_key.as_deref(), Some(API_KEY));
     assert_eq!(requests[0].model, "local-model");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.max_tokens == Some(MAX_OUTPUT_TOKENS))
+    );
     let user: Value = serde_json::from_str(&requests[0].messages[1].1).unwrap();
     assert!(user.get("globalContext").is_some());
     assert!(user.get("meetingContext").is_some());

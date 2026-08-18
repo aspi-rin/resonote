@@ -52,6 +52,9 @@ export interface ProviderPreset {
   endpoint: string;
   id: string;
   label: string;
+  /** Optional override for `meetingNotes.maxInputCharacters` when this preset is
+   *  chosen; presets without it leave the current value untouched. */
+  maxInputCharacters?: number;
   models: string[];
 }
 
@@ -68,7 +71,7 @@ export interface ProviderFetchProps {
  *  list and relies on the fetch button. */
 export const PROVIDER_PRESETS: ProviderPreset[] = [
   { defaultModel: "", endpoint: "http://127.0.0.1:8000/v1", id: "omlx", label: "oMLX", models: [] },
-  { defaultModel: "deepseek-chat", endpoint: "https://api.deepseek.com/v1", id: "deepseek", label: "DeepSeek", models: ["deepseek-chat", "deepseek-reasoner"] },
+  { defaultModel: "deepseek-chat", endpoint: "https://api.deepseek.com/v1", id: "deepseek", label: "DeepSeek", maxInputCharacters: 100_000, models: ["deepseek-chat", "deepseek-reasoner"] },
 ];
 
 export const CUSTOM_PRESET_ID = "custom";
@@ -391,7 +394,7 @@ export function MeetingNotesProviderSection({ action, blocked, fetch, fetchBlock
   return <SettingsSection action={action} icon="chat" title={t("meetingNotesProvider")}>
     <p class="section-note">{t("meetingNotesProviderHint")}</p>
     <div class="form-grid">
-      <ProviderEndpointFields endpoint={settings.meetingNotes.endpoint} endpointLabel={t("meetingNotesEndpoint")} t={t} onEndpoint={(value) => update((next) => { next.meetingNotes.endpoint = value; })} onSelect={(preset) => update((next) => { next.meetingNotes.endpoint = preset.endpoint; next.meetingNotes.model = preset.defaultModel; })} />
+      <ProviderEndpointFields endpoint={settings.meetingNotes.endpoint} endpointLabel={t("meetingNotesEndpoint")} t={t} onEndpoint={(value) => update((next) => { next.meetingNotes.endpoint = value; })} onSelect={(preset) => update((next) => { next.meetingNotes.endpoint = preset.endpoint; next.meetingNotes.model = preset.defaultModel; if (preset.maxInputCharacters !== undefined) next.meetingNotes.maxInputCharacters = preset.maxInputCharacters; })} />
       <ProviderModelField endpoint={settings.meetingNotes.endpoint} fetch={fetch} fetchBlocked={fetchBlocked} label={t("meetingNotesModel")} provider="meetingNotes" t={t} value={settings.meetingNotes.model} onChange={(value) => update((next) => { next.meetingNotes.model = value; })} />
       <ProviderKeyField configured={settings.meetingNotes.apiKeyConfigured} keys={keys} provider="meetingNotes" t={t} />
     </div>

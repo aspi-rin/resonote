@@ -454,6 +454,7 @@ fn translate_text(
     Ok(chat.complete(ChatRequest {
         api_key: api_key.as_ref(),
         endpoint: &document.endpoint,
+        max_tokens: None,
         messages: vec![
             ChatMessage {
                 content: &instruction,

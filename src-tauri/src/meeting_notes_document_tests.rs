@@ -539,6 +539,7 @@ fn serializes_every_stable_error_code_exactly_once() {
         MeetingNotesErrorCode::ProviderTimeout,
         MeetingNotesErrorCode::ProviderUnavailable,
         MeetingNotesErrorCode::ProviderResponseInvalid,
+        MeetingNotesErrorCode::ProviderOutputTruncated,
         MeetingNotesErrorCode::AnalysisBusy,
         MeetingNotesErrorCode::CleanOutputInvalid,
         MeetingNotesErrorCode::SummaryOutputInvalid,
@@ -555,14 +556,14 @@ fn serializes_every_stable_error_code_exactly_once() {
         .map(|code| serde_json::to_string(code).unwrap())
         .collect::<Vec<_>>();
 
-    assert_eq!(codes.len(), 32);
+    assert_eq!(codes.len(), 33);
     assert_eq!(
         serialized
             .iter()
             .map(|value| value.trim_matches('"').to_owned())
             .collect::<HashSet<_>>()
             .len(),
-        32
+        33
     );
     for (code, value) in codes.iter().zip(&serialized) {
         assert_eq!(value.trim_matches('"'), code.as_str());
@@ -571,7 +572,16 @@ fn serializes_every_stable_error_code_exactly_once() {
         MeetingNotesErrorCode::IoError.message_key(),
         "meetingNotesErrorIoError"
     );
+    assert_eq!(
+        MeetingNotesErrorCode::ProviderOutputTruncated.message_key(),
+        "meetingNotesErrorProviderOutputTruncated"
+    );
+    assert_eq!(
+        chat_error_code(&ChatError::OutputTruncated),
+        MeetingNotesErrorCode::ProviderOutputTruncated
+    );
     assert!(MeetingNotesErrorCode::ProviderTimeout.retryable());
+    assert!(MeetingNotesErrorCode::ProviderOutputTruncated.retryable());
     assert!(!MeetingNotesErrorCode::ContextTooLarge.retryable());
 }
 

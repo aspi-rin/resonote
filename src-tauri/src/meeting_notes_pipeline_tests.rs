@@ -545,7 +545,7 @@ fn orders_stale_reasons_by_their_contract_order() {
     current.source.selected_segments.clear();
     current.provider.endpoint = "https://example.com/v1/chat/completions".to_owned();
     current.output_language = OutputLanguage::EnUs;
-    current.chunker_version = "2".to_owned();
+    current.chunker_version = "next".to_owned();
 
     let view = derive_freshness(Some(&result), &current);
 
@@ -640,6 +640,6 @@ fn pins_every_prompt_and_pipeline_version_together() {
             SUMMARY_PROMPT_VERSION,
             SUMMARY_REDUCE_PROMPT_VERSION,
         ),
-        ("1", "1", "1", "1", "1", "1", "1", "1")
+        ("2", "1", "1", "1", "1", "1", "1", "1")
     );
 }

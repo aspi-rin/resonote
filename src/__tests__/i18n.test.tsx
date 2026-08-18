@@ -36,6 +36,7 @@ const ERROR_CODES = [
   "PROVIDER_TIMEOUT",
   "PROVIDER_UNAVAILABLE",
   "PROVIDER_RESPONSE_INVALID",
+  "PROVIDER_OUTPUT_TRUNCATED",
   "ANALYSIS_BUSY",
   "CLEAN_OUTPUT_INVALID",
   "SUMMARY_OUTPUT_INVALID",
@@ -140,7 +141,7 @@ describe("translation dictionaries", () => {
   });
 
   it("localizes every meeting-notes error code in both languages", () => {
-    expect(ERROR_CODES).toHaveLength(32);
+    expect(ERROR_CODES).toHaveLength(33);
     for (const code of ERROR_CODES) {
       const key = messageKeyFor(code);
       expect(dictionaries["zh-CN"][key], code).toBeTruthy();

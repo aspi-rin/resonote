@@ -30,8 +30,9 @@ mod prompts;
 mod reduce;
 
 pub use chunking::{
-    CleanChunk, MINIMUM_BODY_CHARACTERS, ReduceGroup, SummaryChunk, SummaryPlan, chat_messages,
-    measure_request, plan_clean_chunks, plan_reduce_groups, plan_summary,
+    CleanChunk, MAX_CLEAN_OUTPUT_CHARACTERS, MAX_OUTPUT_TOKENS, MINIMUM_BODY_CHARACTERS,
+    ReduceGroup, SummaryChunk, SummaryPlan, chat_messages, measure_request, plan_clean_chunks,
+    plan_reduce_groups, plan_summary,
 };
 pub use parsing::{
     json_payload, parse_clean_response, parse_summary_response, reassemble_clean_result,
@@ -47,7 +48,9 @@ pub use reduce::{
 };
 
 pub const ANALYSIS_SCHEMA_VERSION: u32 = 1;
-pub const CHUNKER_VERSION: &str = "1";
+/// Bumped to "2" when clean chunking gained an expected-output budget: a run
+/// planned by the old chunker must be replanned rather than resumed.
+pub const CHUNKER_VERSION: &str = "2";
 pub const CONTEXT_SCHEMA_VERSION: u32 = 1;
 pub const MERGE_POLICY_VERSION: &str = "1";
 pub const PIPELINE_VERSION: &str = "1";

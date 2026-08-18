@@ -437,6 +437,42 @@ describe("provider presets", () => {
     expect(labelled(section, t("meetingNotesEndpoint")).readOnly).toBe(true);
     expect(labelled(section, t("meetingNotesModel")).value).toBe("deepseek-chat");
     expect(suggestions("meetingNotes")).toEqual(["deepseek-chat", "deepseek-reasoner"]);
+    expect(labelled(section, t("maxInputCharacters")).value).toBe("100000");
+  });
+
+  it("raises the character budget for the DeepSeek preset but leaves it untouched for presets without an override", async () => {
+    scriptAppDefaults({
+      settings: appSettings((next) => {
+        next.meetingNotes.endpoint = "https://internal.example.com/v1";
+        next.meetingNotes.maxInputCharacters = 48_000;
+      }),
+    });
+    await renderApp(t);
+    openTab(t, "settings");
+
+    fireEvent.change(presetSelect(settingsSection(t("meetingNotesProvider"))), { target: { value: "deepseek" } });
+    expect(labelled(settingsSection(t("meetingNotesProvider")), t("maxInputCharacters")).value).toBe("100000");
+
+    // omlx ships no maxInputCharacters override, so the current value must survive the switch.
+    fireEvent.change(presetSelect(settingsSection(t("meetingNotesProvider"))), { target: { value: "omlx" } });
+    expect(labelled(settingsSection(t("meetingNotesProvider")), t("maxInputCharacters")).value).toBe("100000");
+  });
+
+  it("does not add a character budget field to the translation preset selection", async () => {
+    scriptAppDefaults({
+      settings: appSettings((next) => {
+        next.translation.endpoint = "https://internal.example.com/v1";
+      }),
+    });
+    await renderApp(t);
+    openTab(t, "settings");
+
+    expect(within(settingsSection(t("translation"))).queryByText(t("maxInputCharacters"))).toBeNull();
+    fireEvent.change(presetSelect(settingsSection(t("translation"))), { target: { value: "deepseek" } });
+    const section = settingsSection(t("translation"));
+    expect(labelled(section, t("translationEndpoint")).value).toBe("https://api.deepseek.com/v1");
+    expect(labelled(section, t("translationModel")).value).toBe("deepseek-chat");
+    expect(within(section).queryByText(t("maxInputCharacters"))).toBeNull();
   });
 
   it("clears the model for a preset that ships none and unlocks the endpoint on custom", async () => {

@@ -877,6 +877,7 @@ pub enum MeetingNotesErrorCode {
     ProviderTimeout,
     ProviderUnavailable,
     ProviderResponseInvalid,
+    ProviderOutputTruncated,
     AnalysisBusy,
     CleanOutputInvalid,
     SummaryOutputInvalid,
@@ -914,6 +915,7 @@ impl MeetingNotesErrorCode {
             Self::ProviderTimeout => "PROVIDER_TIMEOUT",
             Self::ProviderUnavailable => "PROVIDER_UNAVAILABLE",
             Self::ProviderResponseInvalid => "PROVIDER_RESPONSE_INVALID",
+            Self::ProviderOutputTruncated => "PROVIDER_OUTPUT_TRUNCATED",
             Self::AnalysisBusy => "ANALYSIS_BUSY",
             Self::CleanOutputInvalid => "CLEAN_OUTPUT_INVALID",
             Self::SummaryOutputInvalid => "SUMMARY_OUTPUT_INVALID",
@@ -944,6 +946,7 @@ impl MeetingNotesErrorCode {
             self,
             Self::ContextDraftInvalid
                 | Self::IoError
+                | Self::ProviderOutputTruncated
                 | Self::ProviderRateLimited
                 | Self::ProviderResponseInvalid
                 | Self::ProviderTimeout
@@ -967,6 +970,7 @@ pub fn chat_error_code(error: &ChatError) -> MeetingNotesErrorCode {
         ChatError::InvalidEndpoint { .. } | ChatError::UnexpectedStatus(_) => {
             MeetingNotesErrorCode::InvalidEndpoint
         }
+        ChatError::OutputTruncated => MeetingNotesErrorCode::ProviderOutputTruncated,
         ChatError::ProviderResponseInvalid => MeetingNotesErrorCode::ProviderResponseInvalid,
         ChatError::RateLimited(_) => MeetingNotesErrorCode::ProviderRateLimited,
         ChatError::RequestFailed | ChatError::Unavailable(_) => {

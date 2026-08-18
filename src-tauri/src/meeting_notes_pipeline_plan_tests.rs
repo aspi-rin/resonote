@@ -167,6 +167,85 @@ fn refuses_to_plan_without_four_thousand_characters_of_body_room() {
     assert_eq!(plan_clean_chunks(&snapshot).unwrap().len(), 1);
 }
 
+fn clean_output_characters(parts: &[CleanedPart]) -> usize {
+    serde_json::to_string(parts).unwrap().chars().count()
+}
+
+#[test]
+fn splits_many_small_segments_when_the_echoed_output_would_overflow() {
+    let segments = (1..=300)
+        .map(|id| source_segment(id, &filled(40, "会议内容记录")))
+        .collect::<Vec<_>>();
+    let snapshot = snapshot_with(segments, 200_000);
+
+    let chunks = plan_clean_chunks(&snapshot).unwrap();
+
+    let planned = chunks
+        .iter()
+        .flat_map(|chunk| chunk.parts.clone())
+        .collect::<Vec<_>>();
+    // The request budget alone would have packed all 300 segments into one
+    // chunk: only the expected output budget splits them.
+    assert!(
+        measure_clean(&snapshot, &planned) <= snapshot.provider.max_input_characters as usize,
+        "the whole transcript fits one request, so the split must come from the output budget"
+    );
+    assert!(chunks.len() > 1);
+    for chunk in &chunks {
+        assert!(clean_output_characters(&chunk.parts) <= MAX_CLEAN_OUTPUT_CHARACTERS);
+        assert!(
+            measure_clean(&snapshot, &chunk.parts)
+                <= snapshot.provider.max_input_characters as usize
+        );
+    }
+    assert!(planned.iter().all(|part| part.part_index == 0));
+    assert_eq!(
+        planned
+            .iter()
+            .map(|part| part.segment_id)
+            .collect::<Vec<_>>(),
+        (1..=300).collect::<Vec<_>>()
+    );
+
+    let reassembled = reassemble_clean_result(&snapshot, &planned).unwrap();
+
+    assert_eq!(reassembled.segments.len(), 300);
+    assert_eq!(reassembled.segments[299].segment_id, 300);
+    assert_eq!(reassembled.segments[0].text, filled(40, "会议内容记录"));
+}
+
+#[test]
+fn splits_a_single_segment_against_the_output_budget_when_the_request_fits() {
+    let text = filled(20_000, "会议记录🙂纪要");
+    let snapshot = snapshot_with(vec![source_segment(1, &text)], 200_000);
+
+    let chunks = plan_clean_chunks(&snapshot).unwrap();
+
+    assert!(chunks.len() > 1);
+    for chunk in &chunks {
+        assert!(clean_output_characters(&chunk.parts) <= MAX_CLEAN_OUTPUT_CHARACTERS);
+    }
+    let parts = chunks
+        .iter()
+        .flat_map(|chunk| chunk.parts.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parts.iter().map(|part| part.part_index).collect::<Vec<_>>(),
+        (0..parts.len() as u32).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        parts
+            .iter()
+            .map(|part| part.text.as_str())
+            .collect::<String>(),
+        text
+    );
+    assert_eq!(
+        reassemble_clean_result(&snapshot, &parts).unwrap().segments[0].text,
+        text
+    );
+}
+
 #[test]
 fn splits_an_oversized_segment_into_lossless_unicode_parts() {
     let text = filled(9_000, "会议记录🙂纪要");
@@ -404,6 +483,7 @@ fn never_sends_audio_paths_credentials_or_device_information() {
             CLEAN_SYSTEM_PROMPT,
             &clean_user_message(&snapshot, &plan_clean_chunks(&snapshot).unwrap()[0].parts),
         ),
+        Some(MAX_OUTPUT_TOKENS),
     );
     let summary = request_body(
         &snapshot.provider.model,
@@ -411,6 +491,7 @@ fn never_sends_audio_paths_credentials_or_device_information() {
             &summary_system_prompt(SummaryScope::Direct),
             &summary_user_message(&snapshot, &cleaned().segments),
         ),
+        Some(MAX_OUTPUT_TOKENS),
     );
 
     for body in [&clean, &summary] {

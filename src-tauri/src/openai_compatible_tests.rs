@@ -13,6 +13,7 @@ fn complete(endpoint: &str, api_key: Option<&SecretString>) -> Result<String, Ch
     ReqwestChatClient::new().unwrap().complete(ChatRequest {
         api_key,
         endpoint,
+        max_tokens: None,
         messages: vec![ChatMessage {
             content: "你好",
             role: ChatRole::User,
@@ -105,6 +106,7 @@ fn omits_authorization_when_the_api_key_is_blank() {
     assert!(headers.contains("content-type: application/json"));
     assert!(request.contains("\"temperature\":0"));
     assert!(request.contains("\"content\":\"你好\""));
+    assert!(!request.contains("max_tokens"));
 }
 
 #[test]
@@ -212,6 +214,77 @@ fn rejects_unusable_completion_payloads() {
         );
     }
     assert!(ChatError::ProviderResponseInvalid.retryable());
+}
+
+#[test]
+fn includes_max_tokens_only_when_the_caller_pins_one() {
+    let messages = vec![ChatMessage {
+        content: "你好",
+        role: ChatRole::User,
+    }];
+
+    let default = request_body("notes-model", &messages, None);
+    let pinned = request_body("notes-model", &messages, Some(8_192));
+
+    assert!(!default.contains("max_tokens"));
+    assert!(pinned.contains(r#""max_tokens":8192"#));
+    for body in [&default, &pinned] {
+        assert!(body.contains(r#""temperature":0"#));
+        assert!(body.contains(r#""model":"notes-model""#));
+        assert!(body.contains(r#""content":"你好""#));
+    }
+}
+
+#[test]
+fn reports_a_completion_stopped_at_the_output_limit() {
+    let truncated = r#"{"choices":[{"finish_reason":"length","message":{"content":"{\"parts\":[{\"segmentId\":1"}}]}"#;
+    let empty = r#"{"choices":[{"finish_reason":"length","message":{"content":null}}]}"#;
+
+    assert!(matches!(
+        parse_completion(truncated),
+        Err(ChatError::OutputTruncated)
+    ));
+    assert!(matches!(
+        parse_completion(empty),
+        Err(ChatError::OutputTruncated)
+    ));
+    assert!(ChatError::OutputTruncated.retryable());
+    assert_eq!(ChatError::OutputTruncated.http_status(), None);
+    for intact in [
+        r#"{"choices":[{"finish_reason":"stop","message":{"content":"Hello"}}]}"#,
+        r#"{"choices":[{"finish_reason":null,"message":{"content":"Hello"}}]}"#,
+        r#"{"choices":[{"message":{"content":"Hello"}}]}"#,
+    ] {
+        assert_eq!(parse_completion(intact).unwrap(), "Hello");
+    }
+}
+
+#[test]
+fn sends_the_pinned_output_ceiling_and_surfaces_the_truncation() {
+    let server = serve_once(json_response(
+        "200 OK",
+        r#"{"choices":[{"finish_reason":"length","message":{"content":"partial"}}]}"#,
+    ));
+    let endpoint = format!("http://{}/v1", server.address);
+
+    let error = ReqwestChatClient::new()
+        .unwrap()
+        .complete(ChatRequest {
+            api_key: None,
+            endpoint: &endpoint,
+            max_tokens: Some(8_192),
+            messages: vec![ChatMessage {
+                content: "你好",
+                role: ChatRole::User,
+            }],
+            model: "notes-model",
+            timeout: Duration::from_secs(2),
+        })
+        .unwrap_err();
+
+    let request = server.handle.join().unwrap();
+    assert!(matches!(error, ChatError::OutputTruncated));
+    assert!(request.contains(r#""max_tokens":8192"#));
 }
 
 #[test]
@@ -393,6 +466,7 @@ fn scripted_client_replays_results_in_call_order() {
             client.complete(ChatRequest {
                 api_key: Some(&key),
                 endpoint: "http://127.0.0.1:8000/v1",
+                max_tokens: None,
                 messages: vec![ChatMessage {
                     content,
                     role: ChatRole::User,

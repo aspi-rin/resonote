@@ -18,6 +18,19 @@ use super::{
 
 pub const MINIMUM_BODY_CHARACTERS: usize = 4_000;
 
+/// Output ceiling pinned on every meeting notes request, so a provider default
+/// of a few thousand tokens can never silently truncate a reply.
+pub const MAX_OUTPUT_TOKENS: u32 = 8_192;
+
+/// Budget for the *expected output* of a clean chunk, measured as the character
+/// count of the serialized parts: the model echoes every requested part back
+/// with cleaned text of a similar length. With `MAX_OUTPUT_TOKENS` at 8192 and
+/// CJK costing roughly one token per character on top of the JSON's ASCII
+/// scaffolding, 6000 characters of expected output leaves real headroom.
+/// Without it a chunk that fits the request budget can still demand an answer
+/// far beyond the model's output limit.
+pub const MAX_CLEAN_OUTPUT_CHARACTERS: usize = 6_000;
+
 const CLOSING_CHARACTERS: [char; 16] = [
     '"', '\'', '”', '’', ')', '）', ']', '］', '}', '｝', '」', '』', '》', '〉', '】', '〕',
 ];
@@ -63,7 +76,9 @@ pub fn chat_messages<'a>(system: &'a str, user: &'a str) -> Vec<ChatMessage<'a>>
 /// Meters the exact request body the transport sends, counted in Unicode
 /// scalars.
 pub fn measure_request(model: &str, messages: &[ChatMessage<'_>]) -> usize {
-    request_body(model, messages).chars().count()
+    request_body(model, messages, Some(MAX_OUTPUT_TOKENS))
+        .chars()
+        .count()
 }
 
 /// Greedy bin packing on whole transcript segments in ascending id order. Only a
@@ -78,14 +93,14 @@ pub fn plan_clean_chunks(snapshot: &InputSnapshot) -> Result<Vec<CleanChunk>, Me
             segment_id: segment.id,
             text: segment.text.clone(),
         });
-        if measure_clean(snapshot, &current) <= budget {
+        if clean_chunk_fits(snapshot, budget, &current) {
             continue;
         }
         let whole = current.pop().expect("the candidate part was just pushed");
         if !current.is_empty() {
             close_chunk(&mut chunks, &mut current);
             current.push(whole);
-            if measure_clean(snapshot, &current) <= budget {
+            if clean_chunk_fits(snapshot, budget, &current) {
                 continue;
             }
             current.pop();
@@ -182,6 +197,19 @@ pub fn plan_reduce_groups(
     Ok(groups)
 }
 
+/// A clean chunk is bounded from both sides: the request must fit the provider
+/// context, and the JSON the model has to echo back must fit its output limit.
+fn clean_chunk_fits(snapshot: &InputSnapshot, budget: usize, parts: &[CleanedPart]) -> bool {
+    measure_clean(snapshot, parts) <= budget
+        && measure_clean_output(parts) <= MAX_CLEAN_OUTPUT_CHARACTERS
+}
+
+/// The cleaned parts come back with text of a length close to the input, so the
+/// serialized request parts are a usable stand in for the expected answer.
+fn measure_clean_output(parts: &[CleanedPart]) -> usize {
+    serde_json::to_string(parts).map_or(usize::MAX, |json| json.chars().count())
+}
+
 fn measure_clean(snapshot: &InputSnapshot, parts: &[CleanedPart]) -> usize {
     let user = clean_user_message(snapshot, parts);
     measure_request(
@@ -264,9 +292,9 @@ fn fitting_prefix(
             segment_id,
             text: prefix(remaining, characters).to_owned(),
         });
-        let measured = measure_clean(snapshot, current);
+        let fits = clean_chunk_fits(snapshot, budget, current);
         current.pop();
-        measured <= budget
+        fits
     };
     let total = remaining.chars().count();
     if fits(total) {

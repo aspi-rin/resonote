@@ -16,10 +16,11 @@ use crate::{
         SourceTranscriptStatus, SummaryMode, chat_error_code, load_document, save_document,
     },
     meeting_notes_pipeline::{
-        CLEAN_SYSTEM_PROMPT, SummaryPlan, SummaryScope, chat_messages, clean_user_message,
-        ensure_reduce_converged, merge_summary_candidates, parse_clean_response,
-        parse_summary_response, plan_clean_chunks, plan_reduce_groups, plan_summary,
-        reassemble_clean_result, reduce_user_message, summary_system_prompt, summary_user_message,
+        CLEAN_SYSTEM_PROMPT, MAX_OUTPUT_TOKENS, SummaryPlan, SummaryScope, chat_messages,
+        clean_user_message, ensure_reduce_converged, merge_summary_candidates,
+        parse_clean_response, parse_summary_response, plan_clean_chunks, plan_reduce_groups,
+        plan_summary, reassemble_clean_result, reduce_user_message, summary_system_prompt,
+        summary_user_message,
     },
     openai_compatible::ChatRequest,
 };
@@ -398,6 +399,7 @@ fn request_with_retry<T>(
         let answer = inner.chat.complete(ChatRequest {
             api_key: ticket.api_key.as_ref(),
             endpoint: &provider.endpoint,
+            max_tokens: Some(MAX_OUTPUT_TOKENS),
             messages: chat_messages(request.system, request.user),
             model: &provider.model,
             timeout,
@@ -774,6 +776,7 @@ fn attempt_retryable(code: MeetingNotesErrorCode) -> bool {
         code,
         MeetingNotesErrorCode::CleanOutputInvalid
             | MeetingNotesErrorCode::IoError
+            | MeetingNotesErrorCode::ProviderOutputTruncated
             | MeetingNotesErrorCode::ProviderRateLimited
             | MeetingNotesErrorCode::ProviderResponseInvalid
             | MeetingNotesErrorCode::ProviderTimeout

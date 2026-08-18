@@ -52,6 +52,7 @@ pub fn test_provider(
     chat.complete(ChatRequest {
         api_key: probe.credentials.api_key.as_ref(),
         endpoint: &probe.credentials.endpoint,
+        max_tokens: None,
         messages: vec![ChatMessage {
             content: PROBE_MESSAGE,
             role: ChatRole::User,
