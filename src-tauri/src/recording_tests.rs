@@ -6,7 +6,7 @@ use super::*;
 use crate::{
     audio::TARGET_SAMPLE_RATE,
     capture::CapturedAudio,
-    settings::{AudioFormat, TranslationSettings},
+    settings::{AudioFormat, TranslationSettings, TranslationSnapshot},
 };
 use claxon::FlacReader;
 use std::time::Instant;
@@ -14,7 +14,7 @@ use std::time::Instant;
 fn transcription_config() -> Arc<RwLock<RecordingTranscriptionConfig>> {
     Arc::new(RwLock::new(RecordingTranscriptionConfig {
         transcription: TranscriptionSettings::default(),
-        translation: TranslationSettings::default(),
+        translation: TranslationSnapshot::default(),
     }))
 }
 
@@ -228,6 +228,7 @@ fn missing_vad_model_does_not_leave_recording_in_starting_phase() {
         Arc::new(|_| {}),
         Some(transcription),
         Some(manager),
+        None,
     );
 
     assert!(matches!(
@@ -239,6 +240,27 @@ fn missing_vad_model_does_not_leave_recording_in_starting_phase() {
         Err(RecordingError::Model(ModelError::NotInstalled(_)))
     ));
     assert_eq!(service.status().phase, RecordingPhase::Idle);
+}
+
+#[test]
+fn registers_the_recording_root_in_the_session_catalog() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("recordings");
+    std::fs::create_dir_all(&root).unwrap();
+    let catalog = Arc::new(
+        SessionCatalog::open(directory.path().join(crate::session_catalog::DOCUMENT_NAME)).unwrap(),
+    );
+    let service = RecordingService::with_services(
+        root.clone(),
+        Arc::new(|_| {}),
+        None,
+        None,
+        Some(catalog.clone()),
+    );
+
+    service.register_root(&root);
+
+    assert_eq!(catalog.roots(), vec![std::fs::canonicalize(&root).unwrap()]);
 }
 
 #[test]

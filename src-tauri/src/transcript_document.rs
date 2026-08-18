@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use super::{DOCUMENT_NAME, TranscriptionError};
-use crate::{audio::TARGET_SAMPLE_RATE, settings::TranslationSettings};
+use crate::{audio::TARGET_SAMPLE_RATE, settings::TranslationSnapshot};
 
 const MAX_ATTEMPTS: u32 = 3;
 
@@ -88,7 +88,7 @@ pub struct TranscriptDocument {
     pub status: TranscriptDocumentStatus,
     pub threads: u16,
     #[serde(default)]
-    pub translation: TranslationSettings,
+    pub translation: TranslationSnapshot,
     pub unload_after_idle_minutes: u32,
     pub updated_at: DateTime<Utc>,
 }
@@ -131,6 +131,8 @@ pub(super) fn load_document(path: &Path) -> Result<TranscriptDocument, Transcrip
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
+/// Never recreates the session directory: a deleted session must stay deleted
+/// even when a late transcript write arrives.
 pub(super) fn save_document(
     path: &Path,
     document: &TranscriptDocument,
@@ -138,7 +140,9 @@ pub(super) fn save_document(
     let parent = path
         .parent()
         .ok_or(TranscriptionError::InvalidDocumentPath)?;
-    fs::create_dir_all(parent)?;
+    if !parent.is_dir() {
+        return Err(TranscriptionError::MissingSessionDirectory);
+    }
     let mut temporary = NamedTempFile::new_in(parent)?;
     serde_json::to_writer_pretty(&mut temporary, document)?;
     temporary.write_all(b"\n")?;

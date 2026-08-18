@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
@@ -16,7 +16,8 @@ use crate::{
     asr::{AsrError, SherpaAsrRecognizer},
     audio::{RecoverableWavWriter, TARGET_SAMPLE_RATE, WavError},
     models::{ModelError, ModelManager},
-    settings::{TranscriptionSettings, TranslationSettings},
+    session_lifecycle::SessionLifecycle,
+    settings::{TranscriptionSettings, TranslationSnapshot},
     vad::SpeechSegment,
 };
 
@@ -26,7 +27,7 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub type TranscriptionObserver = Arc<dyn Fn(TranscriptionStatus) + Send + Sync + 'static>;
 pub type SegmentObserver = Arc<dyn Fn(TranscriptSegmentUpdate) + Send + Sync + 'static>;
 pub type CompletionObserver =
-    Arc<dyn Fn(PathBuf, String, TranslationSettings, TranscriptSegment) + Send + Sync + 'static>;
+    Arc<dyn Fn(PathBuf, String, TranslationSnapshot, TranscriptSegment) + Send + Sync + 'static>;
 
 #[path = "transcription_delete.rs"]
 mod deletion;
@@ -48,8 +49,8 @@ pub struct TranscriptionService {
 }
 
 struct TranscriptionInner {
-    document_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     known_sessions: Mutex<HashSet<PathBuf>>,
+    lifecycle: Arc<SessionLifecycle>,
     manager: Arc<ModelManager>,
     completion_observer: CompletionObserver,
     observer: TranscriptionObserver,
@@ -77,6 +78,7 @@ impl TranscriptionService {
             observer,
             segment_observer,
             Arc::new(|_, _, _, _| {}),
+            SessionLifecycle::new(),
         )
     }
 
@@ -85,11 +87,12 @@ impl TranscriptionService {
         observer: TranscriptionObserver,
         segment_observer: SegmentObserver,
         completion_observer: CompletionObserver,
+        lifecycle: Arc<SessionLifecycle>,
     ) -> Self {
         let inner = Arc::new(TranscriptionInner {
             completion_observer,
-            document_locks: Mutex::new(HashMap::new()),
             known_sessions: Mutex::new(HashSet::new()),
+            lifecycle,
             manager,
             observer,
             segment_observer,
@@ -115,7 +118,7 @@ impl TranscriptionService {
         session_id: &str,
         segment: &SpeechSegment,
         settings: &TranscriptionSettings,
-        translation_settings: &TranslationSettings,
+        translation: &TranslationSnapshot,
     ) -> Result<TranscriptSegment, TranscriptionError> {
         let lock = self.inner.document_lock(session_dir);
         let document_guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -123,7 +126,7 @@ impl TranscriptionService {
         let mut document = if path.exists() {
             let mut document = load_document(&path)?;
             document.forced_language = settings.language.clone();
-            document.translation = translation_settings.clone();
+            document.translation = translation.clone();
             document
         } else {
             TranscriptDocument {
@@ -134,7 +137,7 @@ impl TranscriptionService {
                 session_id: session_id.to_owned(),
                 status: TranscriptDocumentStatus::Pending,
                 threads: settings.threads,
-                translation: translation_settings.clone(),
+                translation: translation.clone(),
                 unload_after_idle_minutes: settings.unload_after_idle_minutes,
                 updated_at: Utc::now(),
             }
@@ -196,7 +199,7 @@ impl TranscriptionService {
         session_dir: &Path,
         session_id: &str,
         settings: &TranscriptionSettings,
-        translation_settings: &TranslationSettings,
+        translation: &TranslationSnapshot,
     ) -> Result<(), TranscriptionError> {
         let path = session_dir.join(DOCUMENT_NAME);
         if !path.exists() {
@@ -209,7 +212,7 @@ impl TranscriptionService {
             return Err(TranscriptionError::SessionMismatch);
         }
         document.forced_language = settings.language.clone();
-        document.translation = translation_settings.clone();
+        document.translation = translation.clone();
         document.updated_at = Utc::now();
         save_document(&path, &document)
     }
@@ -281,12 +284,7 @@ impl Drop for TranscriptionService {
 
 impl TranscriptionInner {
     fn document_lock(&self, session_dir: &Path) -> Arc<Mutex<()>> {
-        self.document_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(session_dir.to_path_buf())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        self.lifecycle.session_lock(session_dir)
     }
 
     fn publish(&self, mutate: impl FnOnce(&mut TranscriptionStatus)) {
@@ -374,7 +372,7 @@ fn process_session(
     cached: &mut Option<CachedRecognizer>,
 ) -> Result<bool, TranscriptionError> {
     let path = session_dir.join(DOCUMENT_NAME);
-    if !path.exists() {
+    if !path.exists() || inner.lifecycle.is_deleting(session_dir) {
         return Ok(false);
     }
     let lock = inner.document_lock(session_dir);
@@ -443,6 +441,16 @@ fn process_session(
 
     let (session_id, translation_settings, resolved_snapshot, retryable) = {
         let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A session deleted while this segment was transcribing must not be
+        // written back to disk. `save_document` also refuses to recreate the
+        // session directory; this check drops the result before that error.
+        if inner.lifecycle.is_deleting(session_dir) {
+            tracing::debug!(
+                segment_id,
+                "dropped a transcript result for a deleted session"
+            );
+            return Ok(false);
+        }
         let mut latest = load_document(&path)?;
         let item = latest
             .segments
@@ -558,6 +566,8 @@ pub enum TranscriptionError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Model(#[from] ModelError),
+    #[error("transcript session directory no longer exists")]
+    MissingSessionDirectory,
     #[error("failed to persist transcript: {0}")]
     Persist(#[from] tempfile::PersistError),
     #[error("transcript segment {0} is missing")]

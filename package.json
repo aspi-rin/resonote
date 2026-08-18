@@ -12,8 +12,9 @@
     "format:check": "cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check",
     "lint": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings",
     "test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:web": "vitest run",
     "tauri": "tauri",
-    "verify": "npm run build && npm run format:check && npm run lint && npm test"
+    "verify": "npm run build && npm run format:check && npm run lint && npm test && npm run test:web"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
@@ -23,7 +24,10 @@
   "devDependencies": {
     "@preact/preset-vite": "^2.10.2",
     "@tauri-apps/cli": "2.11.4",
+    "@testing-library/preact": "3.2.4",
+    "jsdom": "29.1.1",
     "typescript": "^5.9.3",
-    "vite": "8.1.5"
+    "vite": "8.1.5",
+    "vitest": "4.1.10"
   }
 }

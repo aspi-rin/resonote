@@ -57,8 +57,20 @@ impl SherpaAsrRecognizer {
         let result = stream.get_result().ok_or(AsrError::MissingResult)?;
         Ok(AsrTranscription {
             language: self.language.clone(),
-            text: result.text.trim().to_owned(),
+            text: meaningful_text(&result.text),
         })
+    }
+}
+
+/// A VAD false positive or a contentless clip often comes back from the ASR
+/// model as bare punctuation (e.g. "...", "。。。"); normalizing that to an empty
+/// string lets downstream code use one check for "nothing was said".
+fn meaningful_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().any(char::is_alphanumeric) {
+        trimmed.to_owned()
+    } else {
+        String::new()
     }
 }
 
@@ -223,6 +235,22 @@ mod tests {
                 .ends_with("large-v3-tokens.txt")
         );
         assert_eq!(stream_language, None);
+    }
+
+    #[test]
+    fn meaningful_text_empties_punctuation_only_output() {
+        assert_eq!(meaningful_text("..."), "");
+        assert_eq!(meaningful_text("。。。"), "");
+        assert_eq!(meaningful_text("…"), "");
+        assert_eq!(meaningful_text(" . , ! "), "");
+        assert_eq!(meaningful_text(""), "");
+    }
+
+    #[test]
+    fn meaningful_text_keeps_any_output_with_a_letter_or_digit() {
+        assert_eq!(meaningful_text("こんにちは"), "こんにちは");
+        assert_eq!(meaningful_text("OK."), "OK.");
+        assert_eq!(meaningful_text("3"), "3");
     }
 
     fn installed_model(family: ModelFamily) -> InstalledModel {
